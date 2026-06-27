@@ -452,6 +452,35 @@ describe("mapTransaction", () => {
         expect(result.payee_name).toBe("Transfer to unknown card");
       });
     });
+
+    describe("particulars/code bank number fallback", () => {
+      it("detects transfer by extracting numbers from particulars and code", () => {
+        const t = rawTxn({ type: "TRANSFER", description: "PM TRANSFER TO 12-3000- 0080008-00expenses" });
+        (t as any).meta = {
+          particulars: "TO 12-3000- ",
+          code: "0080008-00",
+          reference: "expenses"
+        };
+
+        const result = mapTransaction(t, accountId, transferLookup);
+
+        expect(result.payee).toBe("payee-transfer-credit");
+        expect(result.payee_name).toBeUndefined();
+      });
+
+      it("handles particulars and code with no spaces", () => {
+        const t = rawTxn({ type: "TRANSFER", description: "TRANSFER 02-0100- 0100001-07" });
+        (t as any).meta = {
+          particulars: "02-0100-",
+          code: "0100001-07"
+        };
+
+        const result = mapTransaction(t, accountId, transferLookup);
+
+        expect(result.payee).toBe("payee-transfer-savings");
+        expect(result.payee_name).toBeUndefined();
+      });
+    });
   });
 });
 
@@ -658,5 +687,387 @@ describe("Starting Balance", () => {
       expect(result.shouldUpdate).toBe(true);
       expect(result.balanceDateStr).toBe("2025-11-30");
     });
+  });
+});
+
+describe("transfer-like dedup filtering", () => {
+  // Simulates the dedup logic from syncAccount:
+  // 1. Identify which Akahu transactions are "transfer-like" (have other_account or card_suffix)
+  // 2. Only dedup mapped transactions whose imported_id is in the transfer-like set
+  // 3. Non-transfer transactions (standing orders, direct debits) should never be deduped
+  function simulateDedup(
+    akahuTransactions: Transaction[],
+    mappedTransactions: {
+      imported_id?: string;
+      payee?: string;
+      payee_name?: string;
+      date: string;
+      amount: number;
+    }[],
+    existingTransfers: { date: string; amount: number }[],
+  ) {
+    // Step 1: identify transfer-like IDs
+    const transferLikeIds = new Set<string>();
+    for (const t of akahuTransactions) {
+      if (getOtherAccount(t) || getCardSuffix(t)) {
+        transferLikeIds.add(t._id);
+      }
+    }
+
+    // Step 2: filter (same logic as syncAccount)
+    const filtered = mappedTransactions.filter((t) => {
+      if (t.payee) return true;
+      if (!t.imported_id || !transferLikeIds.has(t.imported_id)) return true;
+
+      return !existingTransfers.some(
+        (et) => et.date === t.date && et.amount === t.amount,
+      );
+    });
+
+    return { filtered, transferLikeIds };
+  }
+
+  it("does NOT dedup standing order without other_account or card_suffix", () => {
+    // This is the exact bug scenario: a standing order to Kernel with only
+    // particulars and reference (no other_account, no card_suffix)
+    const standingOrder = rawTxn({
+      _id: "trans_cmqihwmw40vq102jidbz3bw30",
+      description: "TFR TO Kernel NNS7EVWTNNS7EVWT",
+      amount: -400,
+      type: "STANDING ORDER" as Transaction["type"],
+      date: "2026-06-17T12:00:00.000Z",
+    });
+    (standingOrder as any).meta = {
+      particulars: "NNS7EVWT",
+      reference: "NNS7EVWT",
+    };
+
+    const mapped = {
+      imported_id: "trans_cmqihwmw40vq102jidbz3bw30",
+      payee_name: "TFR TO Kernel",
+      date: "2026-06-18", // NZ date
+      amount: -40000,
+    };
+
+    // Existing transfer with same date and amount (the false positive)
+    const existingTransfers = [{ date: "2026-06-18", amount: -40000 }];
+
+    const { filtered } = simulateDedup([standingOrder], [mapped], existingTransfers);
+
+    // Should NOT be deduped — standing order is not transfer-like
+    expect(filtered).toHaveLength(1);
+    expect(filtered[0].imported_id).toBe("trans_cmqihwmw40vq102jidbz3bw30");
+  });
+
+  it("DOES dedup transaction with other_account matching existing transfer", () => {
+    const transfer = enrichedTxn(
+      {
+        _id: "trans_transfer_001",
+        description: "Transfer to Savings",
+        amount: -400,
+        type: "TRANSFER",
+        date: "2026-06-17T12:00:00.000Z",
+      },
+      undefined,
+      { other_account: "02-0100-0100001-07" },
+    );
+
+    const mapped = {
+      imported_id: "trans_transfer_001",
+      payee_name: "Transfer to Savings",
+      date: "2026-06-18",
+      amount: -40000,
+    };
+
+    const existingTransfers = [{ date: "2026-06-18", amount: -40000 }];
+
+    const { filtered } = simulateDedup([transfer], [mapped], existingTransfers);
+
+    // Should be deduped — has other_account, matches existing transfer
+    expect(filtered).toHaveLength(0);
+  });
+
+  it("DOES dedup transaction with card_suffix matching existing transfer", () => {
+    const cardTransfer = rawTxn({
+      _id: "trans_card_001",
+      description: "Card Payment",
+      amount: -250,
+      type: "TRANSFER",
+      date: "2026-06-17T12:00:00.000Z",
+    });
+    (cardTransfer as any).meta = { card_suffix: "7612" };
+
+    const mapped = {
+      imported_id: "trans_card_001",
+      payee_name: "Card Payment",
+      date: "2026-06-18",
+      amount: -25000,
+    };
+
+    const existingTransfers = [{ date: "2026-06-18", amount: -25000 }];
+
+    const { filtered } = simulateDedup([cardTransfer], [mapped], existingTransfers);
+
+    // Should be deduped — has card_suffix
+    expect(filtered).toHaveLength(0);
+  });
+
+  it("keeps transfer-like transaction when no matching existing transfer", () => {
+    const transfer = enrichedTxn(
+      {
+        _id: "trans_transfer_002",
+        description: "Transfer to Savings",
+        amount: -500,
+        type: "TRANSFER",
+        date: "2026-06-17T12:00:00.000Z",
+      },
+      undefined,
+      { other_account: "02-0100-0100001-07" },
+    );
+
+    const mapped = {
+      imported_id: "trans_transfer_002",
+      payee_name: "Transfer to Savings",
+      date: "2026-06-18",
+      amount: -50000,
+    };
+
+    // Existing transfer on different date or amount
+    const existingTransfers = [{ date: "2026-06-19", amount: -50000 }];
+
+    const { filtered } = simulateDedup([transfer], [mapped], existingTransfers);
+
+    // Should NOT be deduped — no matching existing transfer
+    expect(filtered).toHaveLength(1);
+  });
+
+  it("skips dedup check for transactions already mapped as transfers (payee set)", () => {
+    const transfer = enrichedTxn(
+      {
+        _id: "trans_mapped_001",
+        description: "Transfer",
+        amount: -400,
+        type: "TRANSFER",
+        date: "2026-06-17T12:00:00.000Z",
+      },
+      undefined,
+      { other_account: "02-0100-0100001-07" },
+    );
+
+    const mapped = {
+      imported_id: "trans_mapped_001",
+      payee: "payee-transfer-savings", // already mapped as a transfer
+      date: "2026-06-18",
+      amount: -40000,
+    };
+
+    const existingTransfers = [{ date: "2026-06-18", amount: -40000 }];
+
+    const { filtered } = simulateDedup([transfer], [mapped], existingTransfers);
+
+    // Should be kept — already has payee (transfer mapping), dedup skipped
+    expect(filtered).toHaveLength(1);
+  });
+
+  it("handles mix of transfer-like and non-transfer transactions correctly", () => {
+    // Two Akahu transactions on the same date with the same amount:
+    // 1. A standing order to Kernel (NOT transfer-like)
+    // 2. A bank transfer (IS transfer-like)
+    const standingOrder = rawTxn({
+      _id: "trans_standing_001",
+      description: "TFR TO Kernel NNS7EVWT",
+      amount: -400,
+      type: "STANDING ORDER" as Transaction["type"],
+      date: "2026-06-17T12:00:00.000Z",
+    });
+    (standingOrder as any).meta = { particulars: "NNS7EVWT", reference: "NNS7EVWT" };
+
+    const transfer = enrichedTxn(
+      {
+        _id: "trans_bank_transfer_001",
+        description: "Transfer to Savings",
+        amount: -400,
+        type: "TRANSFER",
+        date: "2026-06-17T12:00:00.000Z",
+      },
+      undefined,
+      { other_account: "02-0100-0100001-07" },
+    );
+
+    const mappedStanding = {
+      imported_id: "trans_standing_001",
+      payee_name: "TFR TO Kernel",
+      date: "2026-06-18",
+      amount: -40000,
+    };
+
+    const mappedTransfer = {
+      imported_id: "trans_bank_transfer_001",
+      payee_name: "Transfer to Savings",
+      date: "2026-06-18",
+      amount: -40000,
+    };
+
+    // One existing transfer counterpart for -$400 on that date
+    const existingTransfers = [{ date: "2026-06-18", amount: -40000 }];
+
+    const { filtered } = simulateDedup(
+      [standingOrder, transfer],
+      [mappedStanding, mappedTransfer],
+      existingTransfers,
+    );
+
+    // Standing order should be kept (not transfer-like)
+    // Bank transfer should be deduped (transfer-like, matches existing)
+    expect(filtered).toHaveLength(1);
+    expect(filtered[0].imported_id).toBe("trans_standing_001");
+  });
+
+  it("correctly identifies transfer-like transactions", () => {
+    const withOtherAccount = enrichedTxn(
+      { _id: "t1" },
+      undefined,
+      { other_account: "02-0100-0100001-07" },
+    );
+
+    const withCardSuffix = rawTxn({ _id: "t2" });
+    (withCardSuffix as any).meta = { card_suffix: "7612" };
+
+    const withBothMeta = enrichedTxn(
+      { _id: "t3" },
+      undefined,
+      { other_account: "12-3000-0080008-00" },
+    );
+    (withBothMeta as any).meta.card_suffix = "4321";
+
+    const withOnlyParticulars = rawTxn({ _id: "t4" });
+    (withOnlyParticulars as any).meta = { particulars: "NNS7EVWT", reference: "NNS7EVWT" };
+
+    const noMeta = rawTxn({ _id: "t5" });
+
+    const { transferLikeIds } = simulateDedup(
+      [withOtherAccount, withCardSuffix, withBothMeta, withOnlyParticulars, noMeta],
+      [],
+      [],
+    );
+
+    expect(transferLikeIds.has("t1")).toBe(true);  // other_account
+    expect(transferLikeIds.has("t2")).toBe(true);  // card_suffix
+    expect(transferLikeIds.has("t3")).toBe(true);  // both
+    expect(transferLikeIds.has("t4")).toBe(false);  // only particulars/reference
+    expect(transferLikeIds.has("t5")).toBe(false);  // no meta at all
+  });
+
+  it("does NOT dedup direct debit without transfer indicators", () => {
+    const directDebit = rawTxn({
+      _id: "trans_dd_001",
+      description: "POWER COMPANY LTD",
+      amount: -150,
+      type: "DIRECT DEBIT" as Transaction["type"],
+      date: "2026-06-17T12:00:00.000Z",
+    });
+    (directDebit as any).meta = { particulars: "ELEC", reference: "ACC123456" };
+
+    const mapped = {
+      imported_id: "trans_dd_001",
+      payee_name: "POWER COMPANY LTD",
+      date: "2026-06-18",
+      amount: -15000,
+    };
+
+    // Coincidentally matching existing transfer
+    const existingTransfers = [{ date: "2026-06-18", amount: -15000 }];
+
+    const { filtered } = simulateDedup([directDebit], [mapped], existingTransfers);
+
+    expect(filtered).toHaveLength(1);
+  });
+
+  it("does NOT dedup credit card payment with empty meta", () => {
+    // Real bug: credit card "PAYMENT RECEIVED THANK YOU" with empty meta
+    // was dropped because another account's transfer created a counterpart
+    // with the same date+amount on the credit card side
+    const ccPayment = rawTxn({
+      _id: "trans_cmq9x9kro08v402lhgq772bdl",
+      _account: "acc_cmq1f6ojv00bd02jp5xzgfxjp",
+      description: "PAYMENT RECEIVED THANK YOU",
+      amount: 1825,
+      type: "CREDIT CARD" as Transaction["type"],
+      date: "2026-06-10T12:00:00.000Z",
+    });
+    (ccPayment as any).meta = {};
+
+    const mapped = {
+      imported_id: "trans_cmq9x9kro08v402lhgq772bdl",
+      payee_name: "PAYMENT RECEIVED THANK YOU",
+      date: "2026-06-11", // NZ date
+      amount: 182500,
+    };
+
+    // A transfer counterpart exists (created by syncing the bank account side)
+    const existingTransfers = [{ date: "2026-06-11", amount: 182500 }];
+
+    const { filtered, transferLikeIds } = simulateDedup([ccPayment], [mapped], existingTransfers);
+
+    // Empty meta → not transfer-like → should NOT be deduped
+    expect(transferLikeIds.has("trans_cmq9x9kro08v402lhgq772bdl")).toBe(false);
+    expect(filtered).toHaveLength(1);
+    expect(filtered[0].imported_id).toBe("trans_cmq9x9kro08v402lhgq772bdl");
+  });
+
+  it("does NOT dedup credit card payment even when bank-side transfer matches", () => {
+    // Scenario: bank account sends -$258.05 "MB TRANSFER TO CARD 7162",
+    // credit card receives +$1825 "PAYMENT RECEIVED". Both have no
+    // other_account or card_suffix, so neither should be deduped.
+    const bankTransfer = rawTxn({
+      _id: "trans_cmqaeeoi01tgt02jpebpkebki",
+      description: "MB TRANSFER TO CARD 7162THANK YOU",
+      amount: -258.05,
+      type: "TRANSFER",
+      date: "2026-06-11T12:00:00.000Z",
+    });
+    (bankTransfer as any).meta = {
+      particulars: "TO CARD 7162",
+      reference: "THANK YOU",
+    };
+
+    const ccPayment = rawTxn({
+      _id: "trans_cmq9x9kro08v402lhgq772bdl",
+      description: "PAYMENT RECEIVED THANK YOU",
+      amount: 1825,
+      type: "CREDIT CARD" as Transaction["type"],
+      date: "2026-06-10T12:00:00.000Z",
+    });
+    (ccPayment as any).meta = {};
+
+    const mappedBank = {
+      imported_id: "trans_cmqaeeoi01tgt02jpebpkebki",
+      payee_name: "MB TRANSFER TO CARD 7162THANK YOU",
+      date: "2026-06-12",
+      amount: -25805,
+    };
+
+    const mappedCC = {
+      imported_id: "trans_cmq9x9kro08v402lhgq772bdl",
+      payee_name: "PAYMENT RECEIVED THANK YOU",
+      date: "2026-06-11",
+      amount: 182500,
+    };
+
+    // Existing transfers that coincidentally match amounts
+    const existingTransfers = [
+      { date: "2026-06-12", amount: -25805 },
+      { date: "2026-06-11", amount: 182500 },
+    ];
+
+    const { filtered, transferLikeIds } = simulateDedup(
+      [bankTransfer, ccPayment],
+      [mappedBank, mappedCC],
+      existingTransfers,
+    );
+
+    // Neither has other_account or card_suffix → neither is transfer-like
+    expect(transferLikeIds.size).toBe(0);
+    expect(filtered).toHaveLength(2);
   });
 });

@@ -20,6 +20,7 @@ import {
 import { fetchActualAccounts, fetchAkahuAccounts, runSync, getSyncStatus } from "./sync.js";
 import { initScheduler, startSchedule, stopSchedule } from "./scheduler.js";
 
+process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0"
 // Tee console output to a log file in the data directory
 const LOG_DIR = path.resolve(process.cwd(), "data");
 if (!fs.existsSync(LOG_DIR)) fs.mkdirSync(LOG_DIR, { recursive: true });
