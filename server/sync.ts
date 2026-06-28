@@ -138,6 +138,31 @@ export function getCardSuffix(t: Transaction): string | undefined {
   return undefined;
 }
 
+// NZ bank account format: XX-XXXX-XXXXXXX-XX
+const NZ_ACCOUNT_RE = /^\d{2}-\d{4}-\d{7}-\d{2}$/;
+
+/**
+ * Try to reconstruct a bank account number from meta.particulars + meta.code.
+ *
+ * Some banks (e.g. ANZ) split the target account across two meta fields:
+ *   particulars: "TO 12-3072- "
+ *   code:        "0400082-51"
+ * Combined (after stripping prefix and whitespace): "12-3072-0400082-51"
+ */
+export function mergeMetaAccount(t: Transaction): string | undefined {
+  if (!("meta" in t) || !t.meta) return undefined;
+  const meta = t.meta as Record<string, string>;
+  const particulars = meta.particulars?.trim();
+  const code = meta.code?.trim();
+  if (!particulars || !code) return undefined;
+
+  // Strip common prefixes like "TO ", "FROM "
+  const stripped = particulars.replace(/^(?:TO|FROM)\s+/i, "");
+  const merged = (stripped + code).trim();
+  if (NZ_ACCOUNT_RE.test(merged)) return merged;
+
+  return undefined;
+}
 
 // Map of formatted bank account number → Actual Budget transfer payee ID
 export interface TransferLookup {
@@ -183,19 +208,12 @@ export function mapTransaction(
     }
   }
 
+  // Fallback: some banks split the account number across meta.particulars + meta.code.
+  // Only match if the merged account exists in our mapped accounts.
   if (!transferPayeeId) {
-    let accountNumber;
-    if ("meta" in t && t.meta?.particulars && t.meta?.code) {
-      // Safely extract sequences of digits and hyphens (e.g. "12-3274-")
-      const prefixMatch = t.meta.particulars.match(/[\d-]+/);
-      const codeMatch = t.meta.code.match(/[\d-]+/);
-      
-      if (prefixMatch && codeMatch) {
-        accountNumber = prefixMatch[0] + codeMatch[0];
-      }
-    }
-    if (accountNumber) {
-      const targetActualId = transferLookup.bankNumberToActualId.get(accountNumber);
+    const merged = mergeMetaAccount(t);
+    if (merged) {
+      const targetActualId = transferLookup.bankNumberToActualId.get(merged);
       if (targetActualId && targetActualId !== actualAccountId) {
         transferPayeeId = transferLookup.actualIdToTransferPayeeId.get(targetActualId);
       }
@@ -224,6 +242,36 @@ export function mapTransaction(
     notes,
     cleared: true,
   };
+}
+
+/**
+ * Filter out incoming transactions that match existing transfers in Actual
+ * (by date + amount). Each existing transfer can only match one incoming
+ * transaction to avoid incorrectly deduping multiple payments for the same
+ * amount on the same day. Transactions already mapped as transfers (with a
+ * payee ID) are always kept.
+ */
+export function deduplicateTransfers<T extends { date: string; amount: number; payee?: string }>(
+  incoming: T[],
+  existingTransfers: { id: string; date: string; amount: number }[],
+): { filtered: T[]; deduped: number } {
+  let deduped = 0;
+  const matchedTransferIds = new Set<string>();
+  const filtered = incoming.filter((t) => {
+    // Already mapped as a transfer — always keep
+    if (t.payee) return true;
+
+    const match = existingTransfers.find(
+      (et) => !matchedTransferIds.has(et.id) && et.date === t.date && et.amount === t.amount,
+    );
+    if (match) {
+      matchedTransferIds.add(match.id);
+      deduped++;
+      return false;
+    }
+    return true;
+  });
+  return { filtered, deduped };
 }
 
 /**
@@ -387,19 +435,16 @@ async function syncAccount(
     });
 
     // Transform pending transactions — no imported_id (IDs are unstable
-    // until settled), cleared=false. Actual's fuzzy matching will link
-    // them to the settled version when it arrives.
-    const pendingMapped = pendingTransactions.map((t) => {
-      const { payee, notes } = getPayeeAndNotes(t as unknown as Transaction);
-      return {
-        account: mapping.actualAccountId,
-        date: toLocalDateStr(t.date),
-        amount: Math.round(t.amount * 100),
-        payee_name: payee,
-        notes,
-        cleared: false,
-      };
-    });
+    // until settled), cleared=false. No payee_name is set because pending
+    // transactions lack merchant info and would create ugly payee entities.
+    // The payee gets set when the settled version arrives (see below).
+    const pendingMapped = pendingTransactions.map((t) => ({
+      account: mapping.actualAccountId,
+      date: toLocalDateStr(t.date),
+      amount: Math.round(t.amount * 100),
+      notes: t.description,
+      cleared: false,
+    }));
 
     console.log(
       `[sync] ${mapping.akahuAccountName}: ${allTransactions.length} settled, ${pendingTransactions.length} pending, ${transferCount} transfers`,
@@ -416,45 +461,62 @@ async function syncAccount(
     );
     const existingTransfers = existingActualTxns.filter((t) => t.transfer_id && !t.imported_id);
 
-    let deduped = 0;
-    // Build a set of imported_ids that look like transfers (have other_account or card_suffix)
-    // so we can limit dedup to only genuine transfer-like transactions.
-    const localTransferLikeIds = transferLikeIds ?? new Set<string>();
-    for (const t of allTransactions) {
-      if (getOtherAccount(t) || getCardSuffix(t)) {
-        localTransferLikeIds.add(t._id);
-      }
-    }
-
-    const filteredTransactions = actualTransactions.filter((t) => {
-      // Only check for duplicates on transactions that aren't already mapped as transfers
-      if (t.payee) return true;
-
-      // Only dedup transactions that look like transfers (have other_account or card_suffix).
-      // Non-transfer transactions (standing orders, direct debits, etc.) should never be
-      // matched against transfer counterparts — date+amount alone is too ambiguous.
-      if (!t.imported_id || !localTransferLikeIds.has(t.imported_id)) return true;
-
-      const isDuplicate = existingTransfers.some(
-        (et) => et.date === t.date && et.amount === t.amount,
-      );
-      if (isDuplicate) {
-        deduped++;
-        console.log(
-          `[sync] Skipping duplicate transfer: ${t.payee_name} $${(t.amount / 100).toFixed(2)} on ${t.date}`,
-        );
-      }
-      return !isDuplicate;
-    });
+    const { filtered: filteredTransactions, deduped } = deduplicateTransfers(
+      actualTransactions,
+      existingTransfers,
+    );
 
     if (deduped > 0) {
       console.log(`[sync] ${mapping.akahuAccountName}: filtered ${deduped} duplicate transfer(s)`);
     }
 
+    // Snapshot pending transactions before import so we can detect pending→settled transitions
+    const pendingBeforeImport = existingActualTxns.filter(
+      (t) => !t.cleared && !t.imported_id && !t.transfer_id,
+    );
+
     const result = await api.importTransactions(mapping.actualAccountId, [
       ...filteredTransactions,
       ...pendingMapped,
     ]);
+
+    // Auto-update payees on pending→settled transitions.
+    // When Actual merges a pending transaction with a settled one, it keeps
+    // the old (missing/ugly) payee. We detect these merges and set the payee
+    // from the settled transaction's merchant/clean name.
+    let pendingPayeesUpdated = 0;
+    if (pendingBeforeImport.length > 0) {
+      const postImportTxns = await api.getTransactions(
+        mapping.actualAccountId,
+        "2000-01-01",
+        today,
+      );
+      const payeeList = await api.getPayees();
+      const payeeNameToId = new Map(payeeList.map((p) => [p.name, p.id]));
+
+      for (const prev of pendingBeforeImport) {
+        const current = postImportTxns.find((t) => t.id === prev.id);
+        if (!current?.imported_id) continue; // still pending
+
+        // Find the settled transaction from our batch that matched
+        const settled = actualTransactions.find((t) => t.imported_id === current.imported_id);
+        if (!settled?.payee_name) continue;
+
+        let payeeId = payeeNameToId.get(settled.payee_name);
+        if (!payeeId) {
+          payeeId = await api.createPayee({ name: settled.payee_name });
+          payeeNameToId.set(settled.payee_name, payeeId);
+        }
+        await api.updateTransaction(current.id, { payee: payeeId });
+        pendingPayeesUpdated++;
+      }
+
+      if (pendingPayeesUpdated > 0) {
+        console.log(
+          `[sync] Updated ${pendingPayeesUpdated} payee(s) from pending→settled for ${mapping.akahuAccountName}`,
+        );
+      }
+    }
 
     // Refresh payees on existing transactions if enabled
     let payeesUpdated = 0;
