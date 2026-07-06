@@ -12,6 +12,8 @@ import {
   calculateStartingBalance,
   shouldUpdateStartingBalance,
   getStartingBalanceDate,
+  hasTransactionsBeforeDate,
+  findStalePendingTransactions,
   type TransferLookup,
 } from "./sync.js";
 
@@ -646,6 +648,259 @@ describe("deduplicateTransfers", () => {
       deduplicateTransfers([], [{ id: "t1", date: "2026-06-01", amount: -5000 }]).deduped,
     ).toBe(0);
     expect(deduplicateTransfers([{ date: "2026-06-01", amount: -5000 }], []).deduped).toBe(0);
+  });
+});
+
+// --- hasTransactionsBeforeDate ---
+
+describe("hasTransactionsBeforeDate", () => {
+  const balanceId = "aktualsync-starting-balance-acc_123";
+
+  it("returns 0 when no transactions exist", () => {
+    expect(hasTransactionsBeforeDate([], "2026-06-01", balanceId)).toBe(0);
+  });
+
+  it("returns 0 when all transactions are after the balance date", () => {
+    const txns = [
+      { date: "2026-06-15", imported_id: "txn_1" },
+      { date: "2026-07-01", imported_id: "txn_2" },
+    ];
+    expect(hasTransactionsBeforeDate(txns, "2026-06-01", balanceId)).toBe(0);
+  });
+
+  it("counts transactions on the balance date", () => {
+    const txns = [
+      { date: "2026-06-01", imported_id: "txn_1" },
+      { date: "2026-06-15", imported_id: "txn_2" },
+    ];
+    expect(hasTransactionsBeforeDate(txns, "2026-06-01", balanceId)).toBe(1);
+  });
+
+  it("counts transactions before the balance date", () => {
+    const txns = [
+      { date: "2026-05-01", imported_id: "txn_1" },
+      { date: "2026-05-15", imported_id: "txn_2" },
+      { date: "2026-06-15", imported_id: "txn_3" },
+    ];
+    expect(hasTransactionsBeforeDate(txns, "2026-06-01", balanceId)).toBe(2);
+  });
+
+  it("excludes the starting balance transaction itself", () => {
+    const txns = [
+      { date: "2026-05-31", imported_id: balanceId },
+      { date: "2026-06-15", imported_id: "txn_1" },
+    ];
+    expect(hasTransactionsBeforeDate(txns, "2026-06-01", balanceId)).toBe(0);
+  });
+
+  it("handles transactions with null imported_id", () => {
+    const txns = [
+      { date: "2026-05-15", imported_id: null },
+      { date: "2026-06-15", imported_id: "txn_1" },
+    ];
+    expect(hasTransactionsBeforeDate(txns, "2026-06-01", balanceId)).toBe(1);
+  });
+});
+
+// --- findStalePendingTransactions ---
+
+describe("findStalePendingTransactions", () => {
+  it("finds pending transaction with matching settled counterpart", () => {
+    const txns = [
+      {
+        id: "pending-1",
+        date: "2026-06-01",
+        amount: -5000,
+        cleared: false,
+        imported_id: null,
+        transfer_id: null,
+      },
+      {
+        id: "settled-1",
+        date: "2026-06-01",
+        amount: -5000,
+        cleared: true,
+        imported_id: "akahu_123",
+        transfer_id: null,
+      },
+    ];
+    expect(findStalePendingTransactions(txns)).toEqual(["pending-1"]);
+  });
+
+  it("matches within ±3 day window", () => {
+    const txns = [
+      {
+        id: "pending-1",
+        date: "2026-06-01",
+        amount: -5000,
+        cleared: false,
+        imported_id: null,
+        transfer_id: null,
+      },
+      {
+        id: "settled-1",
+        date: "2026-06-04",
+        amount: -5000,
+        cleared: true,
+        imported_id: "akahu_123",
+        transfer_id: null,
+      },
+    ];
+    expect(findStalePendingTransactions(txns)).toEqual(["pending-1"]);
+  });
+
+  it("does not match beyond 3 day window", () => {
+    const txns = [
+      {
+        id: "pending-1",
+        date: "2026-06-01",
+        amount: -5000,
+        cleared: false,
+        imported_id: null,
+        transfer_id: null,
+      },
+      {
+        id: "settled-1",
+        date: "2026-06-05",
+        amount: -5000,
+        cleared: true,
+        imported_id: "akahu_123",
+        transfer_id: null,
+      },
+    ];
+    expect(findStalePendingTransactions(txns)).toEqual([]);
+  });
+
+  it("does not match different amounts", () => {
+    const txns = [
+      {
+        id: "pending-1",
+        date: "2026-06-01",
+        amount: -5000,
+        cleared: false,
+        imported_id: null,
+        transfer_id: null,
+      },
+      {
+        id: "settled-1",
+        date: "2026-06-01",
+        amount: -5001,
+        cleared: true,
+        imported_id: "akahu_123",
+        transfer_id: null,
+      },
+    ];
+    expect(findStalePendingTransactions(txns)).toEqual([]);
+  });
+
+  it("ignores transfers (has transfer_id)", () => {
+    const txns = [
+      {
+        id: "transfer-1",
+        date: "2026-06-01",
+        amount: -5000,
+        cleared: false,
+        imported_id: null,
+        transfer_id: "xfer_1",
+      },
+      {
+        id: "settled-1",
+        date: "2026-06-01",
+        amount: -5000,
+        cleared: true,
+        imported_id: "akahu_123",
+        transfer_id: null,
+      },
+    ];
+    expect(findStalePendingTransactions(txns)).toEqual([]);
+  });
+
+  it("ignores pending with imported_id (already merged)", () => {
+    const txns = [
+      {
+        id: "merged-1",
+        date: "2026-06-01",
+        amount: -5000,
+        cleared: false,
+        imported_id: "akahu_456",
+        transfer_id: null,
+      },
+      {
+        id: "settled-1",
+        date: "2026-06-01",
+        amount: -5000,
+        cleared: true,
+        imported_id: "akahu_123",
+        transfer_id: null,
+      },
+    ];
+    expect(findStalePendingTransactions(txns)).toEqual([]);
+  });
+
+  it("finds multiple stale pending transactions", () => {
+    const txns = [
+      {
+        id: "pending-1",
+        date: "2026-06-01",
+        amount: -5000,
+        cleared: false,
+        imported_id: null,
+        transfer_id: null,
+      },
+      {
+        id: "pending-2",
+        date: "2026-06-05",
+        amount: -3000,
+        cleared: false,
+        imported_id: null,
+        transfer_id: null,
+      },
+      {
+        id: "settled-1",
+        date: "2026-06-01",
+        amount: -5000,
+        cleared: true,
+        imported_id: "akahu_1",
+        transfer_id: null,
+      },
+      {
+        id: "settled-2",
+        date: "2026-06-06",
+        amount: -3000,
+        cleared: true,
+        imported_id: "akahu_2",
+        transfer_id: null,
+      },
+    ];
+    expect(findStalePendingTransactions(txns)).toEqual(["pending-1", "pending-2"]);
+  });
+
+  it("returns empty for no pending transactions", () => {
+    const txns = [
+      {
+        id: "settled-1",
+        date: "2026-06-01",
+        amount: -5000,
+        cleared: true,
+        imported_id: "akahu_1",
+        transfer_id: null,
+      },
+    ];
+    expect(findStalePendingTransactions(txns)).toEqual([]);
+  });
+
+  it("returns empty when no settled match exists", () => {
+    const txns = [
+      {
+        id: "pending-1",
+        date: "2026-06-01",
+        amount: -5000,
+        cleared: false,
+        imported_id: null,
+        transfer_id: null,
+      },
+    ];
+    expect(findStalePendingTransactions(txns)).toEqual([]);
   });
 });
 

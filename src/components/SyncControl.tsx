@@ -49,6 +49,7 @@ export function SyncControl({ config, onSave, onRefresh }: Props) {
   const [interval, setInterval] = useState(config.schedule.interval);
   const [cleanupManual, setCleanupManual] = useState(false);
   const [refreshPayees, setRefreshPayees] = useState(false);
+  const [setStartingBalance, setSetStartingBalance] = useState(true);
 
   const runSync = async () => {
     setSyncing(true);
@@ -60,6 +61,7 @@ export function SyncControl({ config, onSave, onRefresh }: Props) {
           syncDays: Number(syncDays) || 30,
           cleanupManual,
           refreshPayees,
+          setStartingBalance,
           ...(syncDays === "custom" && customDate ? { startDate: customDate } : {}),
         }),
       });
@@ -235,6 +237,19 @@ export function SyncControl({ config, onSave, onRefresh }: Props) {
                   </p>
                 </div>
                 <Switch size="sm" checked={refreshPayees} onCheckedChange={setRefreshPayees} />
+              </div>
+              <div className="flex items-center justify-between rounded-md border px-3 py-2">
+                <div className="space-y-0.5">
+                  <Label className="text-sm">Set starting balances</Label>
+                  <p className="text-xs text-muted-foreground">
+                    Create or update starting balance transactions
+                  </p>
+                </div>
+                <Switch
+                  size="sm"
+                  checked={setStartingBalance}
+                  onCheckedChange={setSetStartingBalance}
+                />
               </div>
               <p className="text-xs text-center text-muted-foreground">
                 {syncDays === "custom" && customDate

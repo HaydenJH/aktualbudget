@@ -224,6 +224,7 @@ app.post("/api/sync/run", async (req, res) => {
   const syncDays = req.body?.syncDays ?? 30;
   const cleanupManual = req.body?.cleanupManual ?? false;
   const refreshPayees = req.body?.refreshPayees ?? false;
+  const setStartingBalance = req.body?.setStartingBalance ?? true;
   const startDate = req.body?.startDate as string | undefined;
   try {
     const result = await runSync(
@@ -233,6 +234,7 @@ app.post("/api/sync/run", async (req, res) => {
       cleanupManual,
       startDate,
       refreshPayees,
+      setStartingBalance,
     );
     res.json({ success: true, result });
   } catch (error) {
