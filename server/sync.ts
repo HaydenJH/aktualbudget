@@ -252,8 +252,15 @@ export function mapTransaction(
  * A pending transaction is considered stale if:
  * 1. It has no imported_id and no transfer_id (i.e. it was a pending import)
  * 2. It is uncleared
- * 3. A settled (cleared + has imported_id) transaction exists with the
- *    same amount and a date within ±3 days
+ * 3. It does NOT match Akahu's current pending list (same amount, date
+ *    within the window). Settlement can take 4+ days (e.g. Friday card
+ *    purchases settle Tuesday), so a transaction that is still pending at
+ *    the bank must never be deleted, no matter what settled transactions
+ *    happen to share its amount.
+ * 4. A settled (cleared + has imported_id) transaction exists with the
+ *    same amount and a date within ±windowDays. The window matches
+ *    Actual's own fuzzy-merge window (±7 days). Matching is 1:1 — each
+ *    settled transaction can only account for one pending.
  */
 export function findStalePendingTransactions(
   transactions: {
@@ -264,19 +271,52 @@ export function findStalePendingTransactions(
     imported_id?: string | null;
     transfer_id?: string | null;
   }[],
+  currentAkahuPending: { date: string; amount: number }[] = [],
+  windowDays = 7,
 ): string[] {
+  const windowMs = windowDays * 24 * 60 * 60 * 1000;
   const pending = transactions.filter((t) => !t.cleared && !t.imported_id && !t.transfer_id);
   const settled = transactions.filter((t) => t.cleared && t.imported_id);
 
+  // Protect pendings that still exist in Akahu's current pending list.
+  // 1:1 — each Akahu pending protects the nearest-dated unprotected match.
+  const protectedIds = new Set<string>();
+  for (const cp of currentAkahuPending) {
+    const cpDate = new Date(cp.date).getTime();
+    const match = pending
+      .filter(
+        (p) =>
+          !protectedIds.has(p.id) &&
+          p.amount === cp.amount &&
+          Math.abs(new Date(p.date).getTime() - cpDate) <= windowMs,
+      )
+      .sort(
+        (a, b) =>
+          Math.abs(new Date(a.date).getTime() - cpDate) -
+          Math.abs(new Date(b.date).getTime() - cpDate),
+      )[0];
+    if (match) protectedIds.add(match.id);
+  }
+
   const staleIds: string[] = [];
+  const usedSettledIds = new Set<string>();
   for (const p of pending) {
+    if (protectedIds.has(p.id)) continue;
     const pDate = new Date(p.date).getTime();
-    const hasMatch = settled.some(
-      (s) =>
-        s.amount === p.amount &&
-        Math.abs(new Date(s.date).getTime() - pDate) <= 3 * 24 * 60 * 60 * 1000,
-    );
-    if (hasMatch) {
+    const match = settled
+      .filter(
+        (s) =>
+          !usedSettledIds.has(s.id) &&
+          s.amount === p.amount &&
+          Math.abs(new Date(s.date).getTime() - pDate) <= windowMs,
+      )
+      .sort(
+        (a, b) =>
+          Math.abs(new Date(a.date).getTime() - pDate) -
+          Math.abs(new Date(b.date).getTime() - pDate),
+      )[0];
+    if (match) {
+      usedSettledIds.add(match.id);
       staleIds.push(p.id);
     }
   }
@@ -445,12 +485,14 @@ async function syncAccount(
     // These are imported with cleared=false and no imported_id,
     // matching the official Actual Budget Akahu integration.
     let pendingTransactions: PendingTransaction[] = [];
+    let pendingFetchFailed = false;
     try {
       pendingTransactions = await client.accounts.listPendingTransactions(
         userToken,
         mapping.akahuAccountId,
       );
     } catch (e) {
+      pendingFetchFailed = true;
       console.log(
         `[sync] Could not fetch pending transactions for ${mapping.akahuAccountName}:`,
         e,
@@ -574,20 +616,28 @@ async function syncAccount(
 
     // Clean up orphaned pending transactions that Actual failed to merge.
     // These are uncleared transactions (no imported_id) that now have a
-    // matching settled counterpart (same amount, date within ±3 days).
+    // matching settled counterpart, and are no longer in Akahu's current
+    // pending list. Skipped entirely if the pending fetch failed — without
+    // the current pending list we can't tell orphans from live pendings.
     let stalePendingDeleted = 0;
-    const postSyncTxns =
-      pendingBeforeImport.length > 0
-        ? await api.getTransactions(mapping.actualAccountId, "2000-01-01", today)
-        : existingActualTxns;
-    const staleIds = findStalePendingTransactions(postSyncTxns);
-    if (staleIds.length > 0) {
-      for (const id of staleIds) {
-        await api.deleteTransaction(id);
-        stalePendingDeleted++;
+    if (!pendingFetchFailed) {
+      const postSyncTxns =
+        pendingBeforeImport.length > 0
+          ? await api.getTransactions(mapping.actualAccountId, "2000-01-01", today)
+          : existingActualTxns;
+      const staleIds = findStalePendingTransactions(postSyncTxns, pendingMapped);
+      if (staleIds.length > 0) {
+        for (const id of staleIds) {
+          await api.deleteTransaction(id);
+          stalePendingDeleted++;
+        }
+        console.log(
+          `[sync] Deleted ${stalePendingDeleted} stale pending transaction(s) for ${mapping.akahuAccountName}`,
+        );
       }
+    } else {
       console.log(
-        `[sync] Deleted ${stalePendingDeleted} stale pending transaction(s) for ${mapping.akahuAccountName}`,
+        `[sync] Skipping stale pending cleanup for ${mapping.akahuAccountName}: pending fetch failed`,
       );
     }
 

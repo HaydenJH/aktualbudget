@@ -727,7 +727,7 @@ describe("findStalePendingTransactions", () => {
     expect(findStalePendingTransactions(txns)).toEqual(["pending-1"]);
   });
 
-  it("matches within ±3 day window", () => {
+  it("matches within ±7 day window (Actual's fuzzy-merge window)", () => {
     const txns = [
       {
         id: "pending-1",
@@ -739,7 +739,7 @@ describe("findStalePendingTransactions", () => {
       },
       {
         id: "settled-1",
-        date: "2026-06-04",
+        date: "2026-06-08",
         amount: -5000,
         cleared: true,
         imported_id: "akahu_123",
@@ -749,7 +749,7 @@ describe("findStalePendingTransactions", () => {
     expect(findStalePendingTransactions(txns)).toEqual(["pending-1"]);
   });
 
-  it("does not match beyond 3 day window", () => {
+  it("does not match beyond 7 day window", () => {
     const txns = [
       {
         id: "pending-1",
@@ -761,7 +761,7 @@ describe("findStalePendingTransactions", () => {
       },
       {
         id: "settled-1",
-        date: "2026-06-05",
+        date: "2026-06-09",
         amount: -5000,
         cleared: true,
         imported_id: "akahu_123",
@@ -769,6 +769,94 @@ describe("findStalePendingTransactions", () => {
       },
     ];
     expect(findStalePendingTransactions(txns)).toEqual([]);
+  });
+
+  it("protects pending that still exists in Akahu's current pending list", () => {
+    // A Friday card purchase settling on Tuesday sits in Actual for 4+ days.
+    // An unrelated same-amount settled transaction must not get it deleted
+    // while the bank still reports it as pending.
+    const txns = [
+      {
+        id: "pending-1",
+        date: "2026-07-13",
+        amount: -1836,
+        cleared: false,
+        imported_id: null,
+        transfer_id: null,
+      },
+      {
+        id: "settled-other",
+        date: "2026-07-11",
+        amount: -1836,
+        cleared: true,
+        imported_id: "akahu_other",
+        transfer_id: null,
+      },
+    ];
+    const currentPending = [{ date: "2026-07-13", amount: -1836 }];
+    expect(findStalePendingTransactions(txns, currentPending)).toEqual([]);
+  });
+
+  it("protection is 1:1 — extra same-amount orphan is still cleaned up", () => {
+    const txns = [
+      {
+        id: "pending-live",
+        date: "2026-07-13",
+        amount: -1836,
+        cleared: false,
+        imported_id: null,
+        transfer_id: null,
+      },
+      {
+        id: "pending-orphan",
+        date: "2026-07-10",
+        amount: -1836,
+        cleared: false,
+        imported_id: null,
+        transfer_id: null,
+      },
+      {
+        id: "settled-1",
+        date: "2026-07-11",
+        amount: -1836,
+        cleared: true,
+        imported_id: "akahu_123",
+        transfer_id: null,
+      },
+    ];
+    // Akahu still reports one pending, dated July 13 → protects pending-live
+    const currentPending = [{ date: "2026-07-13", amount: -1836 }];
+    expect(findStalePendingTransactions(txns, currentPending)).toEqual(["pending-orphan"]);
+  });
+
+  it("one settled transaction cannot mark two pendings stale (1:1)", () => {
+    const txns = [
+      {
+        id: "pending-1",
+        date: "2026-06-01",
+        amount: -5000,
+        cleared: false,
+        imported_id: null,
+        transfer_id: null,
+      },
+      {
+        id: "pending-2",
+        date: "2026-06-02",
+        amount: -5000,
+        cleared: false,
+        imported_id: null,
+        transfer_id: null,
+      },
+      {
+        id: "settled-1",
+        date: "2026-06-01",
+        amount: -5000,
+        cleared: true,
+        imported_id: "akahu_123",
+        transfer_id: null,
+      },
+    ];
+    expect(findStalePendingTransactions(txns)).toEqual(["pending-1"]);
   });
 
   it("does not match different amounts", () => {
