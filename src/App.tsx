@@ -190,7 +190,7 @@ function App() {
 
   return (
     <div className="dark min-h-screen bg-background text-foreground">
-      <div className="mx-auto max-w-4xl px-6 py-10">
+      <div className="mx-auto max-w-4xl px-4 py-6 sm:px-6 sm:py-10">
         <header className="mb-8 flex items-center gap-4">
           <img src="/logo.png" alt="Aktual Budget Sync" className="h-12 w-12 rounded-xl" />
           <div className="flex-1">
@@ -212,7 +212,7 @@ function App() {
         </header>
 
         <Tabs value={activeTab} onValueChange={setActiveTab}>
-          <TabsList className="mb-6 w-full justify-start">
+          <TabsList className="mb-6 w-full justify-start overflow-x-auto">
             <TabsTrigger value="connections">Connections</TabsTrigger>
             <TabsTrigger value="accounts">Account Mapping</TabsTrigger>
             <TabsTrigger value="sync">Sync</TabsTrigger>
