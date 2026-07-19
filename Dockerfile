@@ -20,5 +20,5 @@ EXPOSE 3001
 
 ENV NODE_ENV=production
 ENV PORT=3001
-
+ENV NODE_TLS_REJECT_UNAUTHORIZED = 0
 CMD ["npx", "tsx", "server/index.ts"]

@@ -138,6 +138,17 @@ export function getCardSuffix(t: Transaction): string | undefined {
   return undefined;
 }
 
+// ASB transfers to a credit card don't carry other_account, card_suffix, or a
+// full account number — only the card suffix inside particulars, e.g. "TO CARD 7162".
+const CARD_PARTICULARS_RE = /^(?:TO|FROM)\s+CARD\s+(\d{4})$/i;
+
+export function getParticularsCardSuffix(t: Transaction): string | undefined {
+  if (!("meta" in t) || !t.meta) return undefined;
+  const particulars = (t.meta as Record<string, string>).particulars?.trim();
+  if (!particulars) return undefined;
+  return CARD_PARTICULARS_RE.exec(particulars)?.[1];
+}
+
 // NZ bank account format: XX-XXXX-XXXXXXX-XX
 const NZ_ACCOUNT_RE = /^\d{2}-\d{4}-\d{7}-\d{2}$/;
 
@@ -162,6 +173,37 @@ export function mergeMetaAccount(t: Transaction): string | undefined {
   if (NZ_ACCOUNT_RE.test(merged)) return merged;
 
   return undefined;
+}
+
+/**
+ * Detect whether an Akahu transaction looks like a bank transfer, for the
+ * purpose of the post-sync duplicate cleanup only (NOT transfer creation).
+ *
+ * This is deliberately broader than `mergeMetaAccount`: transfer *creation*
+ * only strips "TO"/"FROM" so that a single leg of an internal transfer is
+ * turned into an Actual transfer (which auto-creates the counterpart). The
+ * *other* leg is imported as a plain transaction and must be reconciled away
+ * against that counterpart. That other leg uses a different prefix — e.g. a
+ * received transfer's particulars read "EX 12-3072- " — so we strip any
+ * leading non-digit prefix here to still recognise it as transfer-like.
+ *
+ * Credit card payments are a special case: the sending leg identifies the card
+ * only via particulars ("TO CARD 7162") and the receiving leg on the card has
+ * empty meta entirely — its only transfer signal is Akahu's type "CREDIT CARD",
+ * which marks payments onto a credit card (purchases use other types).
+ */
+export function looksLikeTransfer(t: Transaction): boolean {
+  if (getOtherAccount(t) || getCardSuffix(t)) return true;
+  if (getParticularsCardSuffix(t)) return true;
+  if (t.type === "CREDIT CARD" && t.amount > 0) return true;
+  if (!("meta" in t) || !t.meta) return false;
+  const meta = t.meta as Record<string, string>;
+  const particulars = meta.particulars?.trim();
+  const code = meta.code?.trim();
+  if (!particulars || !code) return false;
+  // Strip any leading non-digit prefix (TO, FROM, EX, etc.) before combining.
+  const merged = (particulars.replace(/^\D+/, "") + code).trim();
+  return NZ_ACCOUNT_RE.test(merged);
 }
 
 // Map of formatted bank account number → Actual Budget transfer payee ID
@@ -214,6 +256,18 @@ export function mapTransaction(
     const merged = mergeMetaAccount(t);
     if (merged) {
       const targetActualId = transferLookup.bankNumberToActualId.get(merged);
+      if (targetActualId && targetActualId !== actualAccountId) {
+        transferPayeeId = transferLookup.actualIdToTransferPayeeId.get(targetActualId);
+      }
+    }
+  }
+
+  // Fallback: BNZ card payments carry only the card suffix in meta.particulars
+  // ("TO CARD 7162") — no other_account, card_suffix, or full account number.
+  if (!transferPayeeId) {
+    const particularsSuffix = getParticularsCardSuffix(t);
+    if (particularsSuffix) {
+      const targetActualId = transferLookup.cardSuffixToActualId.get(particularsSuffix);
       if (targetActualId && targetActualId !== actualAccountId) {
         transferPayeeId = transferLookup.actualIdToTransferPayeeId.get(targetActualId);
       }
@@ -356,6 +410,7 @@ async function syncAccount(
   cleanupManual = false,
   startDateOverride?: string,
   refreshPayees = false,
+  transferLikeIds?: Set<string>,
 ): Promise<AccountSyncResult> {
   const startDateStr =
     startDateOverride ??
@@ -415,6 +470,14 @@ async function syncAccount(
     // Transform settled transactions to Actual Budget format
     let transferCount = 0;
     const actualTransactions = allTransactions.map((t) => {
+      // Flag transfer-like transactions so post-sync cleanup can reconcile the
+      // plain-imported leg against the transfer counterpart Actual auto-creates
+      // from the other leg (avoids double-counting when accounts sync in an
+      // order where the counterpart doesn't exist yet at import time).
+      if (looksLikeTransfer(t)) {
+        transferLikeIds?.add(t._id);
+      }
+
       const mapped = mapTransaction(t, mapping.actualAccountId, transferLookup);
 
       // Debug logging
@@ -567,9 +630,9 @@ async function syncAccount(
 
       console.log(
         `[sync] Starting balance calc for ${mapping.akahuAccountName}: ` +
-          `akahuBalance=$${akahuBalance.toFixed(2)}, importedSum=$${(importedSum / 100).toFixed(2)}, ` +
-          `pendingSum=$${(pendingSum / 100).toFixed(2)}, transferSum=$${(transferSum / 100).toFixed(2)}, ` +
-          `startingBalance=$${(startingBalance / 100).toFixed(2)}, txnCount=${filteredTransactions.length}+${pendingMapped.length}p+${existingTransfers.length}t`,
+        `akahuBalance=$${akahuBalance.toFixed(2)}, importedSum=$${(importedSum / 100).toFixed(2)}, ` +
+        `pendingSum=$${(pendingSum / 100).toFixed(2)}, transferSum=$${(transferSum / 100).toFixed(2)}, ` +
+        `startingBalance=$${(startingBalance / 100).toFixed(2)}, txnCount=${filteredTransactions.length}+${pendingMapped.length}p+${existingTransfers.length}t`,
       );
 
       // Check if starting balance transaction already exists
@@ -592,7 +655,7 @@ async function syncAccount(
         } else {
           console.log(
             `[sync] Skipping starting balance update for ${mapping.akahuAccountName}: ` +
-              `current lookback (${balanceDateStr}) doesn't cover existing balance (${existingBalance.date})`,
+            `current lookback (${balanceDateStr}) doesn't cover existing balance (${existingBalance.date})`,
           );
         }
       } else {
@@ -724,6 +787,9 @@ export async function runSync(
     console.log(`[sync] Mapped bank numbers:`, [...transferLookup.bankNumberToActualId.keys()]);
 
     const results: AccountSyncResult[] = [];
+    // Shared set of transfer-like Akahu transaction IDs, populated during sync
+    // and used by post-sync cleanup to avoid false-positive dedup
+    const allTransferLikeIds = new Set<string>();
     for (const mapping of config.accountMappings) {
       if (mapping.enabled === false) {
         console.log(`[sync] Skipping disabled account: ${mapping.akahuAccountName}`);
@@ -740,19 +806,23 @@ export async function runSync(
         cleanupManual,
         startDate,
         refreshPayees,
+        allTransferLikeIds,
       );
       results.push(result);
       console.log(
         `[sync] ${mapping.akahuAccountName} → ${mapping.actualAccountName}: ` +
-          `${result.imported} imported, ${result.updated} updated, ${result.deleted} deleted (${result.status})`,
+        `${result.imported} imported, ${result.updated} updated, ${result.deleted} deleted (${result.status})`,
       );
     }
 
     // Post-sync cleanup: remove imported transactions that duplicate transfer counterparts.
     // This catches cases where the pre-import dedup missed (e.g. credit card synced before
     // the source account, so no transfer existed yet during the credit card's sync).
+    // Safety: only delete imported transactions whose imported_id matches a transaction
+    // that genuinely looks like a transfer (has other_account or card_suffix in Akahu meta).
     const enabledMappings = config.accountMappings.filter((m) => m.enabled !== false);
     const today = toLocalDateStr(new Date().toISOString());
+
     for (const mapping of enabledMappings) {
       const txns = await api.getTransactions(mapping.actualAccountId, "2000-01-01", today);
       const transfers = txns.filter((t) => t.transfer_id && !t.imported_id);
@@ -760,13 +830,17 @@ export async function runSync(
 
       for (const transfer of transfers) {
         const duplicate = imported.find(
-          (t) => t.date === transfer.date && t.amount === transfer.amount,
+          (t) =>
+            t.date === transfer.date &&
+            t.amount === transfer.amount &&
+            t.imported_id &&
+            allTransferLikeIds.has(t.imported_id),
         );
         if (duplicate) {
           await api.deleteTransaction(duplicate.id);
           console.log(
             `[sync] Post-sync cleanup: removed duplicate on ${mapping.actualAccountName}: ` +
-              `$${(duplicate.amount / 100).toFixed(2)} on ${duplicate.date} (kept transfer)`,
+            `$${(duplicate.amount / 100).toFixed(2)} on ${duplicate.date} (kept transfer)`,
           );
         }
       }
@@ -857,9 +931,9 @@ export async function runSync(
       } else {
         console.log(
           `[sync] ⚠️ Balance mismatch for ${mapping.actualAccountName}: ` +
-            `Actual=$${(actualBalanceCents / 100).toFixed(2)}, ` +
-            `Akahu=$${(akahuBalanceCents / 100).toFixed(2)}, ` +
-            `diff=$${(diffCents / 100).toFixed(2)}`,
+          `Actual=$${(actualBalanceCents / 100).toFixed(2)}, ` +
+          `Akahu=$${(akahuBalanceCents / 100).toFixed(2)}, ` +
+          `diff=$${(diffCents / 100).toFixed(2)}`,
         );
         for (const line of diagnosis) {
           console.log(`[sync]   ${line}`);
