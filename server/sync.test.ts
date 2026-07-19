@@ -5,10 +5,12 @@ import {
   getMerchantName,
   getOtherAccount,
   getCardSuffix,
+  getParticularsCardSuffix,
   getPayeeAndNotes,
   mergeMetaAccount,
   mapTransaction,
   deduplicateTransfers,
+  looksLikeTransfer,
   calculateStartingBalance,
   shouldUpdateStartingBalance,
   getStartingBalanceDate,
@@ -127,6 +129,50 @@ describe("getCardSuffix", () => {
   it("returns undefined when meta has no card_suffix", () => {
     const t = enrichedTxn({}, undefined, {});
     expect(getCardSuffix(t)).toBeUndefined();
+  });
+});
+
+// --- getParticularsCardSuffix ---
+
+describe("getParticularsCardSuffix", () => {
+  it("extracts card suffix from TO CARD particulars", () => {
+    const t = rawTxn();
+    (t as any).meta = { particulars: "TO CARD 7162", reference: "groceries" };
+    expect(getParticularsCardSuffix(t)).toBe("7162");
+  });
+
+  it("extracts card suffix from FROM CARD particulars", () => {
+    const t = rawTxn();
+    (t as any).meta = { particulars: "FROM CARD 7162" };
+    expect(getParticularsCardSuffix(t)).toBe("7162");
+  });
+
+  it("handles surrounding whitespace and lowercase", () => {
+    const t = rawTxn();
+    (t as any).meta = { particulars: " to card 7162 " };
+    expect(getParticularsCardSuffix(t)).toBe("7162");
+  });
+
+  it("returns undefined for ordinary particulars", () => {
+    const t = rawTxn();
+    (t as any).meta = { particulars: "Water", reference: "INV99201" };
+    expect(getParticularsCardSuffix(t)).toBeUndefined();
+  });
+
+  it("returns undefined for split account-number particulars", () => {
+    const t = rawTxn();
+    (t as any).meta = { particulars: "TO 38-1234- ", code: "5678901-23" };
+    expect(getParticularsCardSuffix(t)).toBeUndefined();
+  });
+
+  it("returns undefined when particulars embeds extra text", () => {
+    const t = rawTxn();
+    (t as any).meta = { particulars: "PAYMENT TO CARD 7162 THANKS" };
+    expect(getParticularsCardSuffix(t)).toBeUndefined();
+  });
+
+  it("returns undefined for raw transaction without meta", () => {
+    expect(getParticularsCardSuffix(rawTxn())).toBeUndefined();
   });
 });
 
@@ -535,6 +581,96 @@ describe("mapTransaction", () => {
         expect(result.payee).toBe("payee-transfer-freedom");
       });
     });
+
+    describe("credit card via TO CARD particulars (BNZ)", () => {
+      // BNZ mobile-banking transfers to a credit card carry no other_account,
+      // no card_suffix, and no full account number — only "TO CARD XXXX" in
+      // meta.particulars (plus an optional user reference).
+
+      const cardLookup: TransferLookup = {
+        bankNumberToActualId: new Map([
+          ["02-0100-0100001-07", "actual-joint"],
+          ["4835-****-****-7162", "actual-credit-card"],
+        ]),
+        cardSuffixToActualId: new Map([
+          ["0107", "actual-joint"],
+          ["7162", "actual-credit-card"],
+        ]),
+        actualIdToTransferPayeeId: new Map([
+          ["actual-joint", "payee-transfer-joint"],
+          ["actual-credit-card", "payee-transfer-cc"],
+        ]),
+      };
+
+      it("creates a transfer from the bank leg with TO CARD particulars", () => {
+        // Real bug: joint account → credit card payment was imported as a
+        // plain transaction instead of a transfer
+        const t = rawTxn({
+          _id: "trans_cmrlbhurt0qer02l17ymdb2sf",
+          _account: "acc_cmq1f6oji00bb02jpb2zhgwoa",
+          description: "MB TRANSFER TO CARD 7162groceries",
+          amount: -166.47,
+          type: "TRANSFER",
+          date: "2026-07-13T12:00:00.000Z",
+        });
+        (t as any).meta = { particulars: "TO CARD 7162", reference: "groceries" };
+
+        const result = mapTransaction(t, "actual-joint", cardLookup);
+
+        expect(result.payee).toBe("payee-transfer-cc");
+        expect(result.payee_name).toBeUndefined();
+        expect(result.amount).toBe(-16647);
+        expect(result.notes).toBe("MB TRANSFER TO CARD 7162groceries");
+      });
+
+      it("does not self-match the card's own suffix", () => {
+        const t = rawTxn({ description: "CARD PAYMENT", amount: -50 });
+        (t as any).meta = { particulars: "TO CARD 7162" };
+
+        const result = mapTransaction(t, "actual-credit-card", cardLookup);
+        expect(result.payee).toBeUndefined();
+        expect(result.payee_name).toBeDefined();
+      });
+
+      it("falls back to payee_name when card suffix is not mapped", () => {
+        const t = rawTxn({ description: "MB TRANSFER TO CARD 9999" });
+        (t as any).meta = { particulars: "TO CARD 9999" };
+
+        const result = mapTransaction(t, "actual-joint", cardLookup);
+        expect(result.payee).toBeUndefined();
+        expect(result.payee_name).toBeDefined();
+      });
+
+      it("prefers other_account over TO CARD particulars", () => {
+        const t = rawTxn({ description: "Transfer" });
+        (t as any).meta = {
+          other_account: "02-0100-0100001-07",
+          particulars: "TO CARD 7162",
+        };
+
+        const result = mapTransaction(t, "actual-checking", cardLookup);
+        expect(result.payee).toBe("payee-transfer-joint");
+      });
+
+      it("does NOT create a transfer from the card's receiving leg (empty meta)", () => {
+        // The counterpart is auto-created by Actual from the bank leg; the
+        // card's own "PAYMENT RECEIVED" must import plain (then be deduped).
+        const t = rawTxn({
+          _id: "trans_cmrmqtrmd1e1302ldgyy52awf",
+          _account: "acc_cmq1f6ojv00bd02jp5xzgfxjp",
+          description: "PAYMENT RECEIVED groceries",
+          amount: 166.47,
+          type: "CREDIT CARD" as Transaction["type"],
+          date: "2026-07-13T12:00:00.000Z",
+        });
+        (t as any).meta = {};
+
+        const result = mapTransaction(t, "actual-credit-card", cardLookup);
+        expect(result.payee).toBeUndefined();
+        expect(result.payee_name).toBe("PAYMENT RECEIVED groceries");
+        expect(result.amount).toBe(16647);
+      });
+    });
   });
 });
 
@@ -871,10 +1007,10 @@ describe("transfer-like dedup filtering", () => {
     }[],
     existingTransfers: { date: string; amount: number }[],
   ) {
-    // Step 1: identify transfer-like IDs
+    // Step 1: identify transfer-like IDs (mirrors syncAccount, which uses looksLikeTransfer)
     const transferLikeIds = new Set<string>();
     for (const t of akahuTransactions) {
-      if (getOtherAccount(t) || getCardSuffix(t)) {
+      if (looksLikeTransfer(t)) {
         transferLikeIds.add(t._id);
       }
     }
@@ -1123,6 +1259,50 @@ describe("transfer-like dedup filtering", () => {
     expect(transferLikeIds.has("t5")).toBe(false);  // no meta at all
   });
 
+  it("flags the received leg of an internal transfer (EX prefix) as transfer-like", () => {
+    // Real bug: the receiving leg of an internal transfer arrives with an "EX"
+    // particulars prefix (not TO/FROM), so mergeMetaAccount does NOT turn it into
+    // a transfer — it's imported plain. Its counterpart is auto-created by Actual
+    // from the sending ("TO") leg, so the plain import must be recognised as
+    // transfer-like to be cleaned up (otherwise the account doubles by the amount).
+    const receivedLeg = rawTxn({
+      _id: "trans_cmrmqtrla1e0702ld963a6ze4",
+      description: "PM TRANSFER EX 12-3072- 0400082-56expenses",
+      amount: 1200,
+      type: "CREDIT",
+      date: "2026-07-15T12:00:00.000Z",
+    });
+    (receivedLeg as any).meta = {
+      particulars: "EX 12-3072- ",
+      code: "0400082-56",
+      reference: "expenses",
+    };
+
+    // It must be flagged transfer-like (so post-sync cleanup can dedup it)...
+    expect(looksLikeTransfer(receivedLeg)).toBe(true);
+    // ...but must NOT itself be turned into a transfer (only the "TO" leg does that,
+    // otherwise both legs would create transfers and double both accounts).
+    expect(mergeMetaAccount(receivedLeg)).toBeUndefined();
+  });
+
+  it("still creates a transfer from the sending leg (TO prefix)", () => {
+    const sendingLeg = rawTxn({
+      _id: "trans_cmrmqtrj11dz102ld8q45c0qb",
+      description: "PM TRANSFER TO 12-3274- 0243409-00expenses",
+      amount: -1200,
+      type: "DIRECT DEBIT" as Transaction["type"],
+      date: "2026-07-15T12:00:00.000Z",
+    });
+    (sendingLeg as any).meta = {
+      particulars: "TO 12-3274- ",
+      code: "0243409-00",
+      reference: "expenses",
+    };
+
+    expect(looksLikeTransfer(sendingLeg)).toBe(true);
+    expect(mergeMetaAccount(sendingLeg)).toBe("12-3274-0243409-00");
+  });
+
   it("does NOT dedup direct debit without transfer indicators", () => {
     const directDebit = rawTxn({
       _id: "trans_dd_001",
@@ -1148,91 +1328,135 @@ describe("transfer-like dedup filtering", () => {
     expect(filtered).toHaveLength(1);
   });
 
-  it("does NOT dedup credit card payment with empty meta", () => {
-    // Real bug: credit card "PAYMENT RECEIVED THANK YOU" with empty meta
-    // was dropped because another account's transfer created a counterpart
-    // with the same date+amount on the credit card side
+  it("DOES dedup credit card payment (type CREDIT CARD) against a transfer counterpart", () => {
+    // Since the bank leg ("TO CARD 7162") now creates a real transfer, its
+    // auto-created counterpart lands on the credit card. The card's own
+    // "PAYMENT RECEIVED" leg (empty meta, type CREDIT CARD) must reconcile
+    // against it or the card double-counts every payment.
     const ccPayment = rawTxn({
-      _id: "trans_cmq9x9kro08v402lhgq772bdl",
+      _id: "trans_cmrmqtrmd1e1302ldgyy52awf",
       _account: "acc_cmq1f6ojv00bd02jp5xzgfxjp",
-      description: "PAYMENT RECEIVED THANK YOU",
-      amount: 1825,
+      description: "PAYMENT RECEIVED groceries",
+      amount: 166.47,
       type: "CREDIT CARD" as Transaction["type"],
-      date: "2026-06-10T12:00:00.000Z",
+      date: "2026-07-13T12:00:00.000Z",
     });
     (ccPayment as any).meta = {};
 
     const mapped = {
-      imported_id: "trans_cmq9x9kro08v402lhgq772bdl",
-      payee_name: "PAYMENT RECEIVED THANK YOU",
-      date: "2026-06-11", // NZ date
-      amount: 182500,
+      imported_id: "trans_cmrmqtrmd1e1302ldgyy52awf",
+      payee_name: "PAYMENT RECEIVED groceries",
+      date: "2026-07-14", // NZ date
+      amount: 16647,
     };
 
-    // A transfer counterpart exists (created by syncing the bank account side)
-    const existingTransfers = [{ date: "2026-06-11", amount: 182500 }];
+    // Counterpart auto-created by the bank leg's transfer
+    const existingTransfers = [{ date: "2026-07-14", amount: 16647 }];
 
     const { filtered, transferLikeIds } = simulateDedup([ccPayment], [mapped], existingTransfers);
 
-    // Empty meta → not transfer-like → should NOT be deduped
-    expect(transferLikeIds.has("trans_cmq9x9kro08v402lhgq772bdl")).toBe(false);
-    expect(filtered).toHaveLength(1);
-    expect(filtered[0].imported_id).toBe("trans_cmq9x9kro08v402lhgq772bdl");
+    expect(transferLikeIds.has("trans_cmrmqtrmd1e1302ldgyy52awf")).toBe(true);
+    expect(filtered).toHaveLength(0);
   });
 
-  it("does NOT dedup credit card payment even when bank-side transfer matches", () => {
-    // Scenario: bank account sends -$258.05 "MB TRANSFER TO CARD 7162",
-    // credit card receives +$1825 "PAYMENT RECEIVED". Both have no
-    // other_account or card_suffix, so neither should be deduped.
-    const bankTransfer = rawTxn({
-      _id: "trans_cmqaeeoi01tgt02jpebpkebki",
-      description: "MB TRANSFER TO CARD 7162THANK YOU",
-      amount: -258.05,
-      type: "TRANSFER",
-      date: "2026-06-11T12:00:00.000Z",
-    });
-    (bankTransfer as any).meta = {
-      particulars: "TO CARD 7162",
-      reference: "THANK YOU",
-    };
-
+  it("keeps credit card payment when no transfer counterpart matches", () => {
+    // A payment from an unmapped external account: transfer-like, but there is
+    // no counterpart to reconcile against, so it must be imported.
     const ccPayment = rawTxn({
-      _id: "trans_cmq9x9kro08v402lhgq772bdl",
+      _id: "trans_cc_external_001",
       description: "PAYMENT RECEIVED THANK YOU",
-      amount: 1825,
+      amount: 500,
       type: "CREDIT CARD" as Transaction["type"],
-      date: "2026-06-10T12:00:00.000Z",
+      date: "2026-07-13T12:00:00.000Z",
     });
     (ccPayment as any).meta = {};
 
+    const mapped = {
+      imported_id: "trans_cc_external_001",
+      payee_name: "PAYMENT RECEIVED THANK YOU",
+      date: "2026-07-14",
+      amount: 50000,
+    };
+
+    const { filtered } = simulateDedup([ccPayment], [mapped], []);
+
+    expect(filtered).toHaveLength(1);
+  });
+
+  it("does NOT treat negative CREDIT CARD transactions as transfer-like", () => {
+    // Only payments *onto* the card (positive) are transfer legs
+    const reversal = rawTxn({
+      _id: "trans_cc_reversal_001",
+      description: "PAYMENT REVERSAL",
+      amount: -166.47,
+      type: "CREDIT CARD" as Transaction["type"],
+    });
+    (reversal as any).meta = {};
+
+    expect(looksLikeTransfer(reversal)).toBe(false);
+  });
+
+  it("flags the TO CARD bank leg as transfer-like", () => {
+    const bankLeg = rawTxn({
+      _id: "trans_cmrlbhurt0qer02l17ymdb2sf",
+      description: "MB TRANSFER TO CARD 7162groceries",
+      amount: -166.47,
+      type: "TRANSFER",
+      date: "2026-07-13T12:00:00.000Z",
+    });
+    (bankLeg as any).meta = { particulars: "TO CARD 7162", reference: "groceries" };
+
+    expect(looksLikeTransfer(bankLeg)).toBe(true);
+  });
+
+  it("bank-to-card payment: bank leg becomes a transfer, card leg is deduped", () => {
+    // End-to-end shape of the real bug: joint account sends -$166.47
+    // "MB TRANSFER TO CARD 7162", credit card receives +$166.47
+    // "PAYMENT RECEIVED". The bank leg maps to a transfer payee (kept, creates
+    // the counterpart); the card leg matches that counterpart and is dropped.
+    const bankLeg = rawTxn({
+      _id: "trans_cmrlbhurt0qer02l17ymdb2sf",
+      description: "MB TRANSFER TO CARD 7162groceries",
+      amount: -166.47,
+      type: "TRANSFER",
+      date: "2026-07-13T12:00:00.000Z",
+    });
+    (bankLeg as any).meta = { particulars: "TO CARD 7162", reference: "groceries" };
+
+    const ccLeg = rawTxn({
+      _id: "trans_cmrmqtrmd1e1302ldgyy52awf",
+      description: "PAYMENT RECEIVED groceries",
+      amount: 166.47,
+      type: "CREDIT CARD" as Transaction["type"],
+      date: "2026-07-13T12:00:00.000Z",
+    });
+    (ccLeg as any).meta = {};
+
     const mappedBank = {
-      imported_id: "trans_cmqaeeoi01tgt02jpebpkebki",
-      payee_name: "MB TRANSFER TO CARD 7162THANK YOU",
-      date: "2026-06-12",
-      amount: -25805,
+      imported_id: "trans_cmrlbhurt0qer02l17ymdb2sf",
+      payee: "payee-transfer-cc", // mapped as a transfer via TO CARD particulars
+      date: "2026-07-14",
+      amount: -16647,
     };
 
     const mappedCC = {
-      imported_id: "trans_cmq9x9kro08v402lhgq772bdl",
-      payee_name: "PAYMENT RECEIVED THANK YOU",
-      date: "2026-06-11",
-      amount: 182500,
+      imported_id: "trans_cmrmqtrmd1e1302ldgyy52awf",
+      payee_name: "PAYMENT RECEIVED groceries",
+      date: "2026-07-14",
+      amount: 16647,
     };
 
-    // Existing transfers that coincidentally match amounts
-    const existingTransfers = [
-      { date: "2026-06-12", amount: -25805 },
-      { date: "2026-06-11", amount: 182500 },
-    ];
+    // Counterpart on the card created by the bank leg's transfer
+    const existingTransfers = [{ date: "2026-07-14", amount: 16647 }];
 
-    const { filtered, transferLikeIds } = simulateDedup(
-      [bankTransfer, ccPayment],
+    const { filtered } = simulateDedup(
+      [bankLeg, ccLeg],
       [mappedBank, mappedCC],
       existingTransfers,
     );
 
-    // Neither has other_account or card_suffix → neither is transfer-like
-    expect(transferLikeIds.size).toBe(0);
-    expect(filtered).toHaveLength(2);
+    // Bank leg kept (it IS the transfer); card leg deduped against counterpart
+    expect(filtered).toHaveLength(1);
+    expect(filtered[0].imported_id).toBe("trans_cmrlbhurt0qer02l17ymdb2sf");
   });
 });
