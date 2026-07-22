@@ -9,7 +9,7 @@ importers:
   .:
     dependencies:
       '@actual-app/api':
-        specifier: ^26.6.0
+        specifier: ^26.7.0
         version: 26.7.0
       '@base-ui/react':
         specifier: ^1.5.0
@@ -302,8 +302,8 @@ packages:
       '@types/react':
         optional: true
 
-  '@bufbuild/protobuf@2.12.1':
-    resolution: {integrity: sha512-BvAMfS6LrgZiryOAZ4pBYucu4wG/Ei/9o9DZ9akbREnMLbPJiom2i8b9C8IsKErQoiKqVhrerzt3kOT/RrzLHg==}
+  '@bufbuild/protobuf@2.13.0':
+    resolution: {integrity: sha512-acq7c49vxfm1ggJ95P70TX7ABDM0vxr1SYD3BB0o0jnBLB4OAqeHyKuN+cD3w80gXEDQ2zxHpR6CUeA+O/aU9g==}
 
   '@dotenvx/dotenvx@1.75.1':
     resolution: {integrity: sha512-/BITOC9dmS/edY2zQwZNicQ059O6RKabtQfyEafV0nGtfYRNHYy1DIPiYVcov40+tob9hfmBnbR963dS+EQ1DQ==}
@@ -3167,7 +3167,7 @@ snapshots:
 
   '@actual-app/crdt@3.1.0':
     dependencies:
-      '@bufbuild/protobuf': 2.12.1
+      '@bufbuild/protobuf': 2.13.0
       murmurhash: 2.0.1
       uuid: 14.0.1
 
@@ -3383,7 +3383,7 @@ snapshots:
     optionalDependencies:
       '@types/react': 19.2.17
 
-  '@bufbuild/protobuf@2.12.1': {}
+  '@bufbuild/protobuf@2.13.0': {}
 
   '@dotenvx/dotenvx@1.75.1':
     dependencies:
