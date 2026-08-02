@@ -257,10 +257,15 @@ export function mapTransaction(
  *    purchases settle Tuesday), so a transaction that is still pending at
  *    the bank must never be deleted, no matter what settled transactions
  *    happen to share its amount.
- * 4. A settled (cleared + has imported_id) transaction exists with the
- *    same amount and a date within ±windowDays. The window matches
- *    Actual's own fuzzy-merge window (±7 days). Matching is 1:1 — each
- *    settled transaction can only account for one pending.
+ * 4. Either:
+ *    a. A settled (cleared + has imported_id) transaction exists with the
+ *       same amount and a date within ±windowDays. The window matches
+ *       Actual's own fuzzy-merge window (±7 days). Matching is 1:1 — each
+ *       settled transaction can only account for one pending. Or:
+ *    b. The pending was reversed: it left Akahu's pending list without ever
+ *       settling, so no settled match will ever appear. Only detectable once
+ *       the pending's date is more than windowDays before `today` — inside
+ *       that window a missing settled txn could just be settlement lag.
  */
 export function findStalePendingTransactions(
   transactions: {
@@ -273,6 +278,7 @@ export function findStalePendingTransactions(
   }[],
   currentAkahuPending: { date: string; amount: number }[] = [],
   windowDays = 7,
+  today?: string,
 ): string[] {
   const windowMs = windowDays * 24 * 60 * 60 * 1000;
   const pending = transactions.filter((t) => !t.cleared && !t.imported_id && !t.transfer_id);
@@ -317,6 +323,10 @@ export function findStalePendingTransactions(
       )[0];
     if (match) {
       usedSettledIds.add(match.id);
+      staleIds.push(p.id);
+    } else if (today && pDate < new Date(today).getTime() - windowMs) {
+      // Reversed: gone from Akahu's pending list, no settled counterpart,
+      // and old enough that settlement lag can't explain the absence.
       staleIds.push(p.id);
     }
   }
@@ -625,7 +635,7 @@ async function syncAccount(
         pendingBeforeImport.length > 0
           ? await api.getTransactions(mapping.actualAccountId, "2000-01-01", today)
           : existingActualTxns;
-      const staleIds = findStalePendingTransactions(postSyncTxns, pendingMapped);
+      const staleIds = findStalePendingTransactions(postSyncTxns, pendingMapped, 7, today);
       if (staleIds.length > 0) {
         for (const id of staleIds) {
           await api.deleteTransaction(id);

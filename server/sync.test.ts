@@ -771,6 +771,63 @@ describe("findStalePendingTransactions", () => {
     expect(findStalePendingTransactions(txns)).toEqual([]);
   });
 
+  it("deletes reversed pending: gone from Akahu, no settled match, older than window", () => {
+    const txns = [
+      {
+        id: "pending-reversed",
+        date: "2026-06-01",
+        amount: -5000,
+        cleared: false,
+        imported_id: null,
+        transfer_id: null,
+      },
+    ];
+    expect(findStalePendingTransactions(txns, [], 7, "2026-06-09")).toEqual(["pending-reversed"]);
+  });
+
+  it("keeps recent orphan pending without settled match (could be settlement lag)", () => {
+    const txns = [
+      {
+        id: "pending-lagging",
+        date: "2026-06-05",
+        amount: -5000,
+        cleared: false,
+        imported_id: null,
+        transfer_id: null,
+      },
+    ];
+    expect(findStalePendingTransactions(txns, [], 7, "2026-06-09")).toEqual([]);
+  });
+
+  it("does not treat orphan as reversed when today is not provided", () => {
+    const txns = [
+      {
+        id: "pending-old",
+        date: "2026-01-01",
+        amount: -5000,
+        cleared: false,
+        imported_id: null,
+        transfer_id: null,
+      },
+    ];
+    expect(findStalePendingTransactions(txns)).toEqual([]);
+  });
+
+  it("protects live Akahu pending from reversal cleanup even when old", () => {
+    const txns = [
+      {
+        id: "pending-live-old",
+        date: "2026-06-01",
+        amount: -5000,
+        cleared: false,
+        imported_id: null,
+        transfer_id: null,
+      },
+    ];
+    const currentPending = [{ date: "2026-06-01", amount: -5000 }];
+    expect(findStalePendingTransactions(txns, currentPending, 7, "2026-06-20")).toEqual([]);
+  });
+
   it("protects pending that still exists in Akahu's current pending list", () => {
     // A Friday card purchase settling on Tuesday sits in Actual for 4+ days.
     // An unrelated same-amount settled transaction must not get it deleted
