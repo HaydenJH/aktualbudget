@@ -1,16 +1,18 @@
 FROM node:22-slim AS build
 
 WORKDIR /app
-COPY package.json package-lock.json ./
-RUN npm install
+RUN corepack enable && corepack prepare pnpm@latest --activate
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+RUN pnpm install --frozen-lockfile
 COPY . .
-RUN npm run build
+RUN pnpm run build
 
 FROM node:22-slim
 
 WORKDIR /app
-COPY package.json package-lock.json ./
-RUN npm install --omit=dev && npm install tsx
+RUN corepack enable && corepack prepare pnpm@latest --activate
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+RUN pnpm install --frozen-lockfile --prod && pnpm add tsx
 COPY --from=build /app/dist ./dist
 COPY server ./server
 COPY @/ ./@/
@@ -20,5 +22,5 @@ EXPOSE 3001
 
 ENV NODE_ENV=production
 ENV PORT=3001
-ENV NODE_TLS_REJECT_UNAUTHORIZED = 0
-CMD ["npx", "tsx", "server/index.ts"]
+
+CMD ["pnpm", "exec", "tsx", "server/index.ts"]

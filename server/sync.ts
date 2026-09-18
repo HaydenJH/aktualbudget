@@ -138,7 +138,7 @@ export function getCardSuffix(t: Transaction): string | undefined {
   return undefined;
 }
 
-// ASB transfers to a credit card don't carry other_account, card_suffix, or a
+// BNZ transfers to a credit card don't carry other_account, card_suffix, or a
 // full account number — only the card suffix inside particulars, e.g. "TO CARD 7162".
 const CARD_PARTICULARS_RE = /^(?:TO|FROM)\s+CARD\s+(\d{4})$/i;
 
@@ -299,6 +299,95 @@ export function mapTransaction(
 }
 
 /**
+ * Find orphaned pending transactions that now have a matching settled
+ * counterpart. These occur when Actual's fuzzy matching fails to merge
+ * the pending with the settled version (e.g. date shifted slightly).
+ *
+ * A pending transaction is considered stale if:
+ * 1. It has no imported_id and no transfer_id (i.e. it was a pending import)
+ * 2. It is uncleared
+ * 3. It does NOT match Akahu's current pending list (same amount, date
+ *    within the window). Settlement can take 4+ days (e.g. Friday card
+ *    purchases settle Tuesday), so a transaction that is still pending at
+ *    the bank must never be deleted, no matter what settled transactions
+ *    happen to share its amount.
+ * 4. Either:
+ *    a. A settled (cleared + has imported_id) transaction exists with the
+ *       same amount and a date within ±windowDays. The window matches
+ *       Actual's own fuzzy-merge window (±7 days). Matching is 1:1 — each
+ *       settled transaction can only account for one pending. Or:
+ *    b. The pending was reversed: it left Akahu's pending list without ever
+ *       settling, so no settled match will ever appear. Only detectable once
+ *       the pending's date is more than windowDays before `today` — inside
+ *       that window a missing settled txn could just be settlement lag.
+ */
+export function findStalePendingTransactions(
+  transactions: {
+    id: string;
+    date: string;
+    amount: number;
+    cleared?: boolean;
+    imported_id?: string | null;
+    transfer_id?: string | null;
+  }[],
+  currentAkahuPending: { date: string; amount: number }[] = [],
+  windowDays = 7,
+  today?: string,
+): string[] {
+  const windowMs = windowDays * 24 * 60 * 60 * 1000;
+  const pending = transactions.filter((t) => !t.cleared && !t.imported_id && !t.transfer_id);
+  const settled = transactions.filter((t) => t.cleared && t.imported_id);
+
+  // Protect pendings that still exist in Akahu's current pending list.
+  // 1:1 — each Akahu pending protects the nearest-dated unprotected match.
+  const protectedIds = new Set<string>();
+  for (const cp of currentAkahuPending) {
+    const cpDate = new Date(cp.date).getTime();
+    const match = pending
+      .filter(
+        (p) =>
+          !protectedIds.has(p.id) &&
+          p.amount === cp.amount &&
+          Math.abs(new Date(p.date).getTime() - cpDate) <= windowMs,
+      )
+      .sort(
+        (a, b) =>
+          Math.abs(new Date(a.date).getTime() - cpDate) -
+          Math.abs(new Date(b.date).getTime() - cpDate),
+      )[0];
+    if (match) protectedIds.add(match.id);
+  }
+
+  const staleIds: string[] = [];
+  const usedSettledIds = new Set<string>();
+  for (const p of pending) {
+    if (protectedIds.has(p.id)) continue;
+    const pDate = new Date(p.date).getTime();
+    const match = settled
+      .filter(
+        (s) =>
+          !usedSettledIds.has(s.id) &&
+          s.amount === p.amount &&
+          Math.abs(new Date(s.date).getTime() - pDate) <= windowMs,
+      )
+      .sort(
+        (a, b) =>
+          Math.abs(new Date(a.date).getTime() - pDate) -
+          Math.abs(new Date(b.date).getTime() - pDate),
+      )[0];
+    if (match) {
+      usedSettledIds.add(match.id);
+      staleIds.push(p.id);
+    } else if (today && pDate < new Date(today).getTime() - windowMs) {
+      // Reversed: gone from Akahu's pending list, no settled counterpart,
+      // and old enough that settlement lag can't explain the absence.
+      staleIds.push(p.id);
+    }
+  }
+  return staleIds;
+}
+
+/**
  * Filter out incoming transactions that match existing transfers in Actual
  * (by date + amount). Each existing transfer can only match one incoming
  * transaction to avoid incorrectly deduping multiple payments for the same
@@ -368,6 +457,21 @@ export function getStartingBalanceDate(oldestTransactionDate: string): string {
   return toLocalDateStr(d.toISOString());
 }
 
+/**
+ * Check if there are existing transactions on or before the proposed balance
+ * date. If so, creating a starting balance there would corrupt the account
+ * balance because those transactions wouldn't be accounted for in the
+ * starting balance calculation.
+ */
+export function hasTransactionsBeforeDate(
+  existingTxns: { date: string; imported_id?: string | null }[],
+  balanceDateStr: string,
+  balanceImportedId: string,
+): number {
+  return existingTxns.filter((t) => t.imported_id !== balanceImportedId && t.date <= balanceDateStr)
+    .length;
+}
+
 async function buildTransferLookup(
   config: AppConfig,
   akahuAccounts: Account[],
@@ -410,6 +514,7 @@ async function syncAccount(
   cleanupManual = false,
   startDateOverride?: string,
   refreshPayees = false,
+  setStartingBalance = true,
   transferLikeIds?: Set<string>,
 ): Promise<AccountSyncResult> {
   const startDateStr =
@@ -445,12 +550,14 @@ async function syncAccount(
     // These are imported with cleared=false and no imported_id,
     // matching the official Actual Budget Akahu integration.
     let pendingTransactions: PendingTransaction[] = [];
+    let pendingFetchFailed = false;
     try {
       pendingTransactions = await client.accounts.listPendingTransactions(
         userToken,
         mapping.akahuAccountId,
       );
     } catch (e) {
+      pendingFetchFailed = true;
       console.log(
         `[sync] Could not fetch pending transactions for ${mapping.akahuAccountName}:`,
         e,
@@ -580,6 +687,33 @@ async function syncAccount(
       }
     }
 
+    // Clean up orphaned pending transactions that Actual failed to merge.
+    // These are uncleared transactions (no imported_id) that now have a
+    // matching settled counterpart, and are no longer in Akahu's current
+    // pending list. Skipped entirely if the pending fetch failed — without
+    // the current pending list we can't tell orphans from live pendings.
+    let stalePendingDeleted = 0;
+    if (!pendingFetchFailed) {
+      const postSyncTxns =
+        pendingBeforeImport.length > 0
+          ? await api.getTransactions(mapping.actualAccountId, "2000-01-01", today)
+          : existingActualTxns;
+      const staleIds = findStalePendingTransactions(postSyncTxns, pendingMapped, 7, today);
+      if (staleIds.length > 0) {
+        for (const id of staleIds) {
+          await api.deleteTransaction(id);
+          stalePendingDeleted++;
+        }
+        console.log(
+          `[sync] Deleted ${stalePendingDeleted} stale pending transaction(s) for ${mapping.akahuAccountName}`,
+        );
+      }
+    } else {
+      console.log(
+        `[sync] Skipping stale pending cleanup for ${mapping.akahuAccountName}: pending fetch failed`,
+      );
+    }
+
     // Refresh payees on existing transactions if enabled
     let payeesUpdated = 0;
     if (refreshPayees) {
@@ -612,7 +746,7 @@ async function syncAccount(
 
     // Update starting balance from Akahu transactions (excluding deduped transfers)
     const balanceImportedId = `aktualsync-starting-balance-${mapping.akahuAccountId}`;
-    if (akahuBalance != null) {
+    if (setStartingBalance && akahuBalance != null) {
       // Sum imported txns + pending + existing transfer counterparts (which we skipped importing)
       const importedSum = filteredTransactions.reduce((sum, t) => sum + (t.amount ?? 0), 0);
       const pendingSum = pendingMapped.reduce((sum, t) => sum + (t.amount ?? 0), 0);
@@ -630,9 +764,9 @@ async function syncAccount(
 
       console.log(
         `[sync] Starting balance calc for ${mapping.akahuAccountName}: ` +
-        `akahuBalance=$${akahuBalance.toFixed(2)}, importedSum=$${(importedSum / 100).toFixed(2)}, ` +
-        `pendingSum=$${(pendingSum / 100).toFixed(2)}, transferSum=$${(transferSum / 100).toFixed(2)}, ` +
-        `startingBalance=$${(startingBalance / 100).toFixed(2)}, txnCount=${filteredTransactions.length}+${pendingMapped.length}p+${existingTransfers.length}t`,
+          `akahuBalance=$${akahuBalance.toFixed(2)}, importedSum=$${(importedSum / 100).toFixed(2)}, ` +
+          `pendingSum=$${(pendingSum / 100).toFixed(2)}, transferSum=$${(transferSum / 100).toFixed(2)}, ` +
+          `startingBalance=$${(startingBalance / 100).toFixed(2)}, txnCount=${filteredTransactions.length}+${pendingMapped.length}p+${existingTransfers.length}t`,
       );
 
       // Check if starting balance transaction already exists
@@ -655,31 +789,46 @@ async function syncAccount(
         } else {
           console.log(
             `[sync] Skipping starting balance update for ${mapping.akahuAccountName}: ` +
-            `current lookback (${balanceDateStr}) doesn't cover existing balance (${existingBalance.date})`,
+              `current lookback (${balanceDateStr}) doesn't cover existing balance (${existingBalance.date})`,
           );
         }
       } else {
-        // Create new starting balance
-        const categories = await api.getCategories();
-        const startingBalancesCat = categories.find(
-          (c) => "name" in c && c.name === "Starting Balances",
+        // Safety check: don't create starting balance if transactions already
+        // exist before the proposed balance date (would corrupt the balance).
+        const conflictCount = hasTransactionsBeforeDate(
+          existingActualTxns,
+          balanceDateStr,
+          balanceImportedId,
         );
+        if (conflictCount > 0) {
+          console.error(
+            `[sync] ERROR: Cannot create starting balance for ${mapping.akahuAccountName} on ${balanceDateStr} — ` +
+              `${conflictCount} transaction(s) already exist on or before that date. ` +
+              `Use a wider lookback period to include them.`,
+          );
+        } else {
+          // Create new starting balance
+          const categories = await api.getCategories();
+          const startingBalancesCat = categories.find(
+            (c) => "name" in c && c.name === "Starting Balances",
+          );
 
-        await api.importTransactions(mapping.actualAccountId, [
-          {
-            account: mapping.actualAccountId,
-            date: balanceDateStr,
-            amount: startingBalance,
-            payee_name: "Starting Balance",
-            notes: "Auto generated by aktualsync",
-            imported_id: balanceImportedId,
-            category: startingBalancesCat?.id,
-            cleared: true,
-          },
-        ]);
-        console.log(
-          `[sync] Added starting balance for ${mapping.akahuAccountName}: $${(startingBalance / 100).toFixed(2)} (date: ${balanceDateStr})`,
-        );
+          await api.importTransactions(mapping.actualAccountId, [
+            {
+              account: mapping.actualAccountId,
+              date: balanceDateStr,
+              amount: startingBalance,
+              payee_name: "Starting Balance",
+              notes: "Auto generated by aktualsync",
+              imported_id: balanceImportedId,
+              category: startingBalancesCat?.id,
+              cleared: true,
+            },
+          ]);
+          console.log(
+            `[sync] Added starting balance for ${mapping.akahuAccountName}: $${(startingBalance / 100).toFixed(2)} (date: ${balanceDateStr})`,
+          );
+        }
       }
     }
 
@@ -735,6 +884,7 @@ export async function runSync(
   cleanupManual = false,
   startDate?: string,
   refreshPayees = false,
+  setStartingBalance = true,
 ): Promise<SyncHistoryEntry> {
   if (isSyncing) {
     throw new Error("Sync is already running");
@@ -806,12 +956,13 @@ export async function runSync(
         cleanupManual,
         startDate,
         refreshPayees,
+        setStartingBalance,
         allTransferLikeIds,
       );
       results.push(result);
       console.log(
         `[sync] ${mapping.akahuAccountName} → ${mapping.actualAccountName}: ` +
-        `${result.imported} imported, ${result.updated} updated, ${result.deleted} deleted (${result.status})`,
+          `${result.imported} imported, ${result.updated} updated, ${result.deleted} deleted (${result.status})`,
       );
     }
 
@@ -840,7 +991,7 @@ export async function runSync(
           await api.deleteTransaction(duplicate.id);
           console.log(
             `[sync] Post-sync cleanup: removed duplicate on ${mapping.actualAccountName}: ` +
-            `$${(duplicate.amount / 100).toFixed(2)} on ${duplicate.date} (kept transfer)`,
+              `$${(duplicate.amount / 100).toFixed(2)} on ${duplicate.date} (kept transfer)`,
           );
         }
       }
@@ -931,9 +1082,9 @@ export async function runSync(
       } else {
         console.log(
           `[sync] ⚠️ Balance mismatch for ${mapping.actualAccountName}: ` +
-          `Actual=$${(actualBalanceCents / 100).toFixed(2)}, ` +
-          `Akahu=$${(akahuBalanceCents / 100).toFixed(2)}, ` +
-          `diff=$${(diffCents / 100).toFixed(2)}`,
+            `Actual=$${(actualBalanceCents / 100).toFixed(2)}, ` +
+            `Akahu=$${(akahuBalanceCents / 100).toFixed(2)}, ` +
+            `diff=$${(diffCents / 100).toFixed(2)}`,
         );
         for (const line of diagnosis) {
           console.log(`[sync]   ${line}`);

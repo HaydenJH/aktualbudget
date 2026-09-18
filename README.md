@@ -6,6 +6,8 @@ If you self-host Actual Budget and bank in New Zealand, this app bridges the gap
 
 ![Screenshot](docs/screenshot.png)
 
+> **Already have Akahu bank sync in Actual?** Actual Budget supports Akahu natively through its built-in [bank sync](https://actualbudget.org/docs/advanced/bank-sync/), and for most people that is the simplest option. This app is for when you want more out of the Akahu data: it reads the richer transaction metadata Akahu exposes (merchant details, particulars/code/reference, card suffix, other-account numbers) to detect transfers between your accounts, clean up bank-mangled payee names, split notes out of descriptions, track pending transactions through to settlement, and validate balances against the bank after each sync.
+
 ## Features
 
 - **Connect** to your Actual Budget server and Akahu account with a simple UI
@@ -42,8 +44,8 @@ docker compose up -d
 ## Development
 
 ```bash
-npm install
-npm run dev
+pnpm install
+pnpm dev
 ```
 
 This starts the Vite frontend on `:5173` and the Express backend on `:3001` concurrently.

@@ -1,12 +1,7 @@
 import { useState } from "react";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-} from "@/components/ui/select";
+import { Select, SelectContent, SelectItem, SelectTrigger } from "@/components/ui/select";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Badge } from "@/components/ui/badge";
@@ -66,9 +61,7 @@ export function DevTools({ akahuAccounts, actualAccounts }: Props) {
   const deleteSelectionLabel = () => {
     if (deleteIds.length === 0) return "Select account(s)…";
     if (deleteIds.includes(ALL_ACCOUNTS)) return "ALL accounts";
-    const names = deleteIds.map(
-      (id) => actualAccounts.find((a) => a.id === id)?.name ?? id,
-    );
+    const names = deleteIds.map((id) => actualAccounts.find((a) => a.id === id)?.name ?? id);
     return names.length <= 2 ? names.join(", ") : `${names.length} accounts`;
   };
 
@@ -102,9 +95,7 @@ export function DevTools({ akahuAccounts, actualAccounts }: Props) {
           (sum, r) => sum + r.deleted,
           0,
         );
-        toast.success(
-          `Deleted ${total} transaction(s) from ${data.results.length} account(s)`,
-        );
+        toast.success(`Deleted ${total} transaction(s) from ${data.results.length} account(s)`);
       } else {
         toast.error(data.error || "Failed to delete");
       }
@@ -176,7 +167,7 @@ export function DevTools({ akahuAccounts, actualAccounts }: Props) {
           </CardDescription>
         </CardHeader>
         <CardContent>
-          <div className="flex items-end gap-3">
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-end">
             <div className="flex-1 space-y-1.5">
               <Label>Akahu Accounts</Label>
               <Select multiple value={accountIds} onValueChange={setAccountIds}>
@@ -195,7 +186,7 @@ export function DevTools({ akahuAccounts, actualAccounts }: Props) {
                 </SelectContent>
               </Select>
             </div>
-            <div className="w-44 space-y-1.5">
+            <div className="space-y-1.5 sm:w-44">
               <Label>Start Date</Label>
               <Input
                 type="date"
@@ -204,7 +195,11 @@ export function DevTools({ akahuAccounts, actualAccounts }: Props) {
                 max={new Date().toISOString().split("T")[0]}
               />
             </div>
-            <Button onClick={fetchTransactions} disabled={loading} className="gap-2">
+            <Button
+              onClick={fetchTransactions}
+              disabled={loading}
+              className="w-full gap-2 sm:w-auto"
+            >
               {loading ? (
                 <Loader2 className="h-4 w-4 animate-spin" />
               ) : (
@@ -228,7 +223,57 @@ export function DevTools({ akahuAccounts, actualAccounts }: Props) {
             </CardTitle>
           </CardHeader>
           <CardContent className="p-0">
-            <div className="max-h-[600px] overflow-auto">
+            {/* Mobile: compact tappable list */}
+            <div className="max-h-[600px] overflow-y-auto sm:hidden">
+              {transactions.map((t, i) => {
+                const desc = (t.raw as any).description ?? "";
+                const differs = payeeDiffers(t);
+                return (
+                  <button
+                    key={i}
+                    onClick={() => setSelected(t)}
+                    className="flex w-full flex-col gap-1 border-b px-4 py-3 text-left transition-colors hover:bg-muted/50"
+                  >
+                    <div className="flex items-start justify-between gap-3">
+                      <span className="min-w-0 flex-1 truncate text-sm">{desc}</span>
+                      <span
+                        className={`shrink-0 text-sm tabular-nums ${
+                          t.computed.amount < 0 ? "text-red-400" : "text-green-400"
+                        }`}
+                      >
+                        {formatAmount(t.computed.amount)}
+                      </span>
+                    </div>
+                    <div className="flex min-w-0 items-center gap-1.5 text-xs text-muted-foreground">
+                      <span className="shrink-0">{t.computed.date}</span>
+                      {t.pending ? (
+                        <Badge
+                          variant="outline"
+                          className="h-4 shrink-0 px-1 text-[10px] border-yellow-500/50 text-yellow-500"
+                        >
+                          pending
+                        </Badge>
+                      ) : (
+                        <>
+                          <span className="truncate">→ {t.computed.payee}</span>
+                          {differs && (
+                            <Badge
+                              variant={t.computed.merchantName ? "default" : "secondary"}
+                              className="h-4 shrink-0 px-1 text-[10px]"
+                            >
+                              {t.computed.merchantName ? "merchant" : "cleaned"}
+                            </Badge>
+                          )}
+                        </>
+                      )}
+                    </div>
+                  </button>
+                );
+              })}
+            </div>
+
+            {/* Desktop: full table */}
+            <div className="hidden max-h-[600px] overflow-auto sm:block">
               <table className="w-full text-sm">
                 <thead className="sticky top-0 bg-card text-left text-xs text-muted-foreground">
                   <tr className="border-b">
@@ -313,7 +358,7 @@ export function DevTools({ akahuAccounts, actualAccounts }: Props) {
       {selected && (
         <Card>
           <CardHeader className="pb-3">
-            <div className="flex items-center gap-3">
+            <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
               <Button variant="ghost" size="sm" onClick={() => setSelected(null)}>
                 ← Back
               </Button>
@@ -334,40 +379,44 @@ export function DevTools({ akahuAccounts, actualAccounts }: Props) {
           <CardContent>
             <div className="space-y-4">
               <div className="rounded-lg border bg-muted/30 p-3 space-y-2">
-                <div className="flex items-center justify-between">
-                  <span className="text-xs text-muted-foreground">Import Payee</span>
+                <div className="flex flex-col gap-0.5 sm:flex-row sm:items-baseline sm:justify-between">
+                  <span className="shrink-0 text-xs text-muted-foreground">Import Payee</span>
                   {selected.pending ? (
                     <span className="text-muted-foreground italic">no payee (pending)</span>
                   ) : (
-                    <span className="font-medium">{selected.computed.payee}</span>
+                    <span className="min-w-0 break-words font-medium sm:text-right">
+                      {selected.computed.payee}
+                    </span>
                   )}
                 </div>
-                <div className="flex items-center justify-between">
-                  <span className="text-xs text-muted-foreground">Merchant Name</span>
-                  <span className={selected.computed.merchantName ? "" : "text-muted-foreground"}>
+                <div className="flex flex-col gap-0.5 sm:flex-row sm:items-baseline sm:justify-between">
+                  <span className="shrink-0 text-xs text-muted-foreground">Merchant Name</span>
+                  <span
+                    className={`min-w-0 break-words sm:text-right ${selected.computed.merchantName ? "" : "text-muted-foreground"}`}
+                  >
                     {selected.computed.merchantName ?? "none"}
                   </span>
                 </div>
-                <div className="flex items-center justify-between">
-                  <span className="text-xs text-muted-foreground">Description</span>
-                  <span className="max-w-[400px] truncate text-right">
+                <div className="flex flex-col gap-0.5 sm:flex-row sm:items-baseline sm:justify-between">
+                  <span className="shrink-0 text-xs text-muted-foreground">Description</span>
+                  <span className="min-w-0 break-words sm:text-right">
                     {(selected.raw as any).description}
                   </span>
                 </div>
-                <div className="flex items-center justify-between">
-                  <span className="text-xs text-muted-foreground">Notes</span>
-                  <span className="max-w-[400px] truncate text-right text-muted-foreground">
+                <div className="flex flex-col gap-0.5 sm:flex-row sm:items-baseline sm:justify-between">
+                  <span className="shrink-0 text-xs text-muted-foreground">Notes</span>
+                  <span className="min-w-0 break-words text-muted-foreground sm:text-right">
                     {selected.computed.notes}
                   </span>
                 </div>
                 {(selected.raw as any).meta && (
                   <div className="border-t pt-2 mt-2 space-y-1">
                     <span className="text-xs text-muted-foreground">Meta Fields</span>
-                    <div className="grid grid-cols-2 gap-1 text-xs">
+                    <div className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-xs">
                       {Object.entries((selected.raw as any).meta).map(([k, v]) => (
                         <div key={k} className="contents">
                           <span className="text-muted-foreground">{k}</span>
-                          <span className="truncate text-right">{String(v)}</span>
+                          <span className="min-w-0 break-words text-right">{String(v)}</span>
                         </div>
                       ))}
                     </div>
